@@ -1,0 +1,5 @@
+field,value
+genome_fasta,/path/to/assembly.fa
+rnaseq_bam_dir,/path/to/rnaseq_bams/
+species_name,my_species
+busco_lineage,vertebrata_odb10

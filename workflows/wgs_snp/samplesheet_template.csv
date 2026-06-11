@@ -1,0 +1,4 @@
+sample,r1,r2
+fish_001,/home/cylin/data/tilapia_wgs/fish_001_R1.fastq.gz,/home/cylin/data/tilapia_wgs/fish_001_R2.fastq.gz
+fish_002,/home/cylin/data/tilapia_wgs/fish_002_R1.fastq.gz,/home/cylin/data/tilapia_wgs/fish_002_R2.fastq.gz
+fish_003,/home/cylin/data/tilapia_wgs/fish_003_R1.fastq.gz,/home/cylin/data/tilapia_wgs/fish_003_R2.fastq.gz

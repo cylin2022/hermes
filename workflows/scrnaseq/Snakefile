@@ -1,0 +1,191 @@
+"""
+scRNA-seq analysis pipeline
+Steps: FastQC → STARsolo → scDblFinder → Scanpy (QC/norm/cluster/markers)
+Supports: 10x Chromium v2/v3, Drop-seq
+"""
+
+from pathlib import Path
+
+# ── Samplesheet ───────────────────────────────────────────────────────────────
+# CSV with header: sample,r1,r2
+# IMPORTANT: For 10x Chromium, R1 = barcode+UMI reads, R2 = cDNA reads.
+# STARsolo reads them as --readFilesIn R2 R1 (cDNA first) — do NOT swap here.
+import csv
+
+def _read_samplesheet(path):
+    ss = {}
+    with open(path) as fh:
+        for row in csv.DictReader(fh):
+            sid = row["sample"].strip()
+            ss[sid] = {"r1": row["r1"].strip(), "r2": row["r2"].strip()}
+    if not ss:
+        raise ValueError(f"Samplesheet '{path}' has no valid rows")
+    return ss
+
+_SS     = _read_samplesheet(config["samplesheet"])
+SAMPLES = list(_SS.keys())
+
+# ── Config ────────────────────────────────────────────────────────────────────
+OUTDIR         = Path(config["outdir"])
+GENOME_FASTA   = config["genome_fasta"]
+GENOME_GTF     = config["genome_gtf"]
+CHEMISTRY      = config.get("chemistry", "10xv3")       # 10xv2 | 10xv3 | dropseq
+EXPECTED_CELLS = int(config.get("expected_cells", 5000))
+MIN_GENES      = int(config.get("min_genes", 200))
+MAX_GENES      = int(config.get("max_genes", 6000))
+MAX_MT_PCT     = float(config.get("max_mt_pct", 20))
+MT_PREFIX      = config.get("mt_gene_prefix", "MT-")    # MT- human/mouse; mt: fly/worm
+N_HVG          = int(config.get("n_hvg", 3000))
+N_PCS          = int(config.get("n_pcs", 50))
+RESOLUTION     = float(config.get("resolution", 0.5))
+THREADS        = int(config.get("threads", 16))
+MEM_GB         = int(config.get("mem_gb", 128))
+STAR_INDEX     = config.get("star_index", str(OUTDIR / "star_index"))
+SA_NBASES      = int(config.get("star_sa_index_nbases", 14))  # reduce for small genomes
+
+# Chemistry → STARsolo CB/UMI parameters
+_CHEM = {
+    "10xv2":   "--soloType CB_UMI_Simple --soloCBwhitelist None --soloCBlen 16 --soloUMIlen 10",
+    "10xv3":   "--soloType CB_UMI_Simple --soloCBwhitelist None --soloCBlen 16 --soloUMIlen 12",
+    "dropseq": "--soloType CB_UMI_Simple --soloCBwhitelist None --soloCBlen 12 --soloUMIlen 8",
+}
+CHEM_ARGS = _CHEM.get(CHEMISTRY, _CHEM["10xv3"])
+
+wildcard_constraints:
+    sample = "|".join(SAMPLES),
+
+# ── Target rule ───────────────────────────────────────────────────────────────
+rule all:
+    input:
+        str(OUTDIR / "multiqc" / "multiqc_report.html"),
+        expand(str(OUTDIR / "starsolo" / "{sample}" / "Solo.out" / "Gene" / "filtered" / "matrix.mtx"), sample=SAMPLES),
+        expand(str(OUTDIR / "doublets" / "{sample}_doublet_scores.csv"), sample=SAMPLES),
+        str(OUTDIR / "scanpy" / "final_adata.h5ad"),
+        str(OUTDIR / "scanpy" / "umap_clusters.pdf"),
+        str(OUTDIR / "scanpy" / "marker_genes.csv"),
+
+# ── Raw read QC ───────────────────────────────────────────────────────────────
+rule fastqc:
+    input:
+        r1 = lambda wc: _SS[wc.sample]["r1"],
+        r2 = lambda wc: _SS[wc.sample]["r2"],
+    output:
+        h1 = str(OUTDIR / "fastqc" / "{sample}_R1_fastqc.html"),
+        h2 = str(OUTDIR / "fastqc" / "{sample}_R2_fastqc.html"),
+        z1 = str(OUTDIR / "fastqc" / "{sample}_R1_fastqc.zip"),
+        z2 = str(OUTDIR / "fastqc" / "{sample}_R2_fastqc.zip"),
+    threads: 4
+    conda: "envs/qc.yaml"
+    shell:
+        "fastqc -t {threads} -o $(dirname {output.h1}) {input.r1} {input.r2}"
+
+rule multiqc:
+    input:
+        expand(str(OUTDIR / "fastqc" / "{sample}_R2_fastqc.zip"), sample=SAMPLES),
+        expand(str(OUTDIR / "starsolo" / "{sample}" / "Log.final.out"), sample=SAMPLES),
+    output:
+        str(OUTDIR / "multiqc" / "multiqc_report.html"),
+    conda: "envs/qc.yaml"
+    shell:
+        "multiqc {OUTDIR}/fastqc/ {OUTDIR}/starsolo/ -o {OUTDIR}/multiqc/ --force"
+
+# ── STAR genome index ─────────────────────────────────────────────────────────
+rule star_index:
+    input:
+        fasta = GENOME_FASTA,
+        gtf   = GENOME_GTF,
+    output:
+        directory(STAR_INDEX),
+    params:
+        sa = SA_NBASES,
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/star.yaml"
+    shell:
+        """
+        mkdir -p {output}
+        STAR --runMode genomeGenerate \
+             --genomeDir {output} \
+             --genomeFastaFiles {input.fasta} \
+             --sjdbGTFfile {input.gtf} \
+             --runThreadN {threads} \
+             --genomeSAindexNbases {params.sa}
+        """
+
+# ── STARsolo: alignment + barcode/UMI counting ────────────────────────────────
+# R1 = barcode+UMI read; R2 = cDNA read  (10x convention)
+rule starsolo:
+    input:
+        r1    = lambda wc: _SS[wc.sample]["r1"],
+        r2    = lambda wc: _SS[wc.sample]["r2"],
+        index = STAR_INDEX,
+    output:
+        matrix   = str(OUTDIR / "starsolo" / "{sample}" / "Solo.out" / "Gene" / "filtered" / "matrix.mtx"),
+        barcodes = str(OUTDIR / "starsolo" / "{sample}" / "Solo.out" / "Gene" / "filtered" / "barcodes.tsv"),
+        features = str(OUTDIR / "starsolo" / "{sample}" / "Solo.out" / "Gene" / "filtered" / "features.tsv"),
+        bam      = str(OUTDIR / "starsolo" / "{sample}" / "Aligned.sortedByCoord.out.bam"),
+        log      = str(OUTDIR / "starsolo" / "{sample}" / "Log.final.out"),
+    params:
+        outpfx = str(OUTDIR / "starsolo" / "{sample}") + "/",
+        chem   = CHEM_ARGS,
+        ncells = EXPECTED_CELLS,
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/star.yaml"
+    shell:
+        """
+        mkdir -p {params.outpfx}
+        STAR --runThreadN {threads} \
+             --genomeDir {input.index} \
+             --readFilesIn {input.r2} {input.r1} \
+             --readFilesCommand zcat \
+             --outSAMtype BAM SortedByCoordinate \
+             --outSAMattributes NH HI nM AS CR UR CB UB GX GN sS sQ sM \
+             {params.chem} \
+             --soloCellFilter EmptyDrops_CR \
+             --soloCellReadStats Standard \
+             --soloFeatures Gene \
+             --outFileNamePrefix {params.outpfx}
+        samtools index {output.bam}
+        """
+
+# ── Doublet detection: scDblFinder (R/Bioconductor) ──────────────────────────
+rule doublet_detection:
+    input:
+        mtx_dir = str(OUTDIR / "starsolo" / "{sample}" / "Solo.out" / "Gene" / "filtered"),
+    output:
+        scores  = str(OUTDIR / "doublets" / "{sample}_doublet_scores.csv"),
+    params:
+        sample  = "{sample}",
+    conda: "envs/r_scrna.yaml"
+    script: "scripts/doublet_detection.R"
+
+# ── Scanpy: merge → QC filter → normalise → HVG → PCA → UMAP → cluster ───────
+rule scanpy_pipeline:
+    input:
+        matrices = expand(
+            str(OUTDIR / "starsolo" / "{sample}" / "Solo.out" / "Gene" / "filtered" / "matrix.mtx"),
+            sample=SAMPLES,
+        ),
+        doublets = expand(str(OUTDIR / "doublets" / "{sample}_doublet_scores.csv"), sample=SAMPLES),
+    output:
+        adata   = str(OUTDIR / "scanpy" / "final_adata.h5ad"),
+        umap    = str(OUTDIR / "scanpy" / "umap_clusters.pdf"),
+        markers = str(OUTDIR / "scanpy" / "marker_genes.csv"),
+    params:
+        samples      = SAMPLES,
+        starsolo_dir = str(OUTDIR / "starsolo"),
+        doublet_dir  = str(OUTDIR / "doublets"),
+        min_genes    = MIN_GENES,
+        max_genes    = MAX_GENES,
+        max_mt_pct   = MAX_MT_PCT,
+        mt_prefix    = MT_PREFIX,
+        n_hvg        = N_HVG,
+        n_pcs        = N_PCS,
+        resolution   = RESOLUTION,
+        outdir       = str(OUTDIR / "scanpy"),
+    threads: THREADS
+    conda: "envs/scanpy.yaml"
+    script: "scripts/scanpy_pipeline.py"

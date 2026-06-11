@@ -1,0 +1,3 @@
+sample,r1,r2
+liver_rep1,/home/cylin/data/scrna/liver_rep1_R1.fastq.gz,/home/cylin/data/scrna/liver_rep1_R2.fastq.gz
+liver_rep2,/home/cylin/data/scrna/liver_rep2_R1.fastq.gz,/home/cylin/data/scrna/liver_rep2_R2.fastq.gz

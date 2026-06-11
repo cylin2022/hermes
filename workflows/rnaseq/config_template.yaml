@@ -1,0 +1,26 @@
+# RNA-seq Workflow Configuration Template
+# Fill in all fields, then pass to run_workflow()
+
+# Input
+# CSV with header: sample, group, r1, r2
+# group = condition label used in DESeq2 contrasts (must match comparisons below)
+# Use samplesheet_template.csv as a starting point.
+samplesheet: "/path/to/samplesheet.csv"
+
+# Reference
+species: "Mus_musculus"                  # or Homo_sapiens, custom
+genome_build: "GRCm39"                   # used to fetch STAR index
+gtf: ""                                  # leave empty to auto-download
+
+# Analysis
+comparisons:                             # DESeq2 contrasts
+  - ["treatment", "control"]
+padj_threshold: 0.05
+log2fc_threshold: 1.0
+
+# Resources
+threads_align: 16
+mem_gb: 64
+
+# Output
+outdir: "/path/to/output/"

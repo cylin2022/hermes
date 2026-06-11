@@ -1,0 +1,396 @@
+"""
+WGS SNP/INDEL calling pipeline for non-model organisms
+Steps: fastp → BWA-MEM2 → samtools markdup → DeepVariant (gVCF per sample) →
+       GLnexus (joint calling) → GQ/DP filter → SNPeff annotation (custom DB)
+
+DeepVariant runs via Docker so the GPU-enabled image is used automatically.
+The conda env for this rule only provides tabix; Docker handles everything else.
+Parent directories of the reference and BAM are bind-mounted at their host paths
+inside the container so no path translation is needed.
+"""
+
+from pathlib import Path
+
+# ── Samplesheet ───────────────────────────────────────────────────────────────
+# CSV with header: sample,r1,r2
+# Each row = one individual; r1/r2 are absolute paths to gzipped FASTQ files.
+import csv
+
+def _read_samplesheet(path):
+    ss = {}
+    with open(path) as fh:
+        for row in csv.DictReader(fh):
+            sid = row["sample"].strip()
+            ss[sid] = {"r1": row["r1"].strip(), "r2": row["r2"].strip()}
+    if not ss:
+        raise ValueError(f"Samplesheet '{path}' has no valid rows")
+    return ss
+
+_SS     = _read_samplesheet(config["samplesheet"])
+SAMPLES = list(_SS.keys())
+
+# ── Config ────────────────────────────────────────────────────────────────────
+OUTDIR       = Path(config["outdir"])
+GENOME       = config["genome_fasta"]
+SPECIES_NAME = config.get("species_name", "custom_species")
+GTF          = config.get("gtf", "")
+GFF          = config.get("gff", "")
+PLOIDY       = int(config.get("ploidy", 2))
+
+MIN_GQ       = int(config.get("min_gq", 20))
+MIN_DP       = int(config.get("min_depth", 5))
+
+THREADS      = int(config.get("threads", 16))
+MEM_GB       = int(config.get("mem_gb", 64))
+# GPU-enabled DeepVariant Docker image (set use_gpu: false to fall back to CPU conda)
+USE_GPU      = str(config.get("use_gpu", "true")).lower() == "true"
+DV_IMAGE     = config.get("dv_docker_image", "google/deepvariant:1.6.1")
+
+GENOME_FAI   = GENOME + ".fai"
+ANNOT_FILE   = GTF if GTF else GFF
+ANNOT_TYPE   = "gtf22" if GTF else "gff3"
+
+wildcard_constraints:
+    sample = "|".join(SAMPLES),
+
+# ── Target rule ───────────────────────────────────────────────────────────────
+rule all:
+    input:
+        str(OUTDIR / "multiqc" / "multiqc_report.html"),
+        expand(str(OUTDIR / "alignment" / "{sample}.markdup.flagstat"), sample=SAMPLES),
+        str(OUTDIR / "vcf" / "filtered" / "snps.PASS.vcf.gz"),
+        str(OUTDIR / "vcf" / "filtered" / "indels.PASS.vcf.gz"),
+        str(OUTDIR / "annotation" / "snps.annotated.vcf.gz") if ANNOT_FILE else [],
+        str(OUTDIR / "stats" / "variant_summary.txt"),
+
+# ── QC + adapter trimming ─────────────────────────────────────────────────────
+rule fastp:
+    input:
+        r1  = lambda wc: _SS[wc.sample]["r1"],
+        r2  = lambda wc: _SS[wc.sample]["r2"],
+    output:
+        r1   = str(OUTDIR / "trimmed" / "{sample}_R1.fastq.gz"),
+        r2   = str(OUTDIR / "trimmed" / "{sample}_R2.fastq.gz"),
+        html = str(OUTDIR / "fastp" / "{sample}.html"),
+        json = str(OUTDIR / "fastp" / "{sample}.json"),
+    threads: 8
+    conda: "envs/qc.yaml"
+    shell:
+        """
+        fastp -i {input.r1} -I {input.r2} \
+              -o {output.r1} -O {output.r2} \
+              -h {output.html} -j {output.json} \
+              --thread {threads} \
+              --detect_adapter_for_pe \
+              --correction \
+              --trim_poly_g \
+              --qualified_quality_phred 20 \
+              --length_required 50
+        """
+
+rule multiqc:
+    input:
+        expand(str(OUTDIR / "fastp" / "{sample}.json"), sample=SAMPLES),
+        expand(str(OUTDIR / "alignment" / "{sample}.markdup.flagstat"), sample=SAMPLES),
+    output:
+        str(OUTDIR / "multiqc" / "multiqc_report.html"),
+    conda: "envs/qc.yaml"
+    shell:
+        "multiqc {OUTDIR}/fastp/ {OUTDIR}/alignment/ -o {OUTDIR}/multiqc/ --force"
+
+# ── Index reference genome ────────────────────────────────────────────────────
+rule bwa_index:
+    input: GENOME,
+    output: GENOME + ".bwt.2bit.64",
+    conda: "envs/align.yaml"
+    shell: "bwa-mem2 index {input}"
+
+rule samtools_fai:
+    input: GENOME,
+    output: GENOME_FAI,
+    conda: "envs/align.yaml"
+    shell: "samtools faidx {input}"
+
+# ── Alignment → fixmate → sort → markdup (pure samtools, no GATK needed) ─────
+# Fixmate must run on name-sorted output to set mate-score tags for markdup.
+rule bwa_mem2:
+    input:
+        r1  = str(OUTDIR / "trimmed" / "{sample}_R1.fastq.gz"),
+        r2  = str(OUTDIR / "trimmed" / "{sample}_R2.fastq.gz"),
+        idx = GENOME + ".bwt.2bit.64",
+    output:
+        bam = temp(str(OUTDIR / "alignment" / "{sample}.namesorted.bam")),
+    params:
+        rg  = r"@RG\tID:{sample}\tSM:{sample}\tPL:ILLUMINA\tLB:{sample}",
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/align.yaml"
+    shell:
+        """
+        bwa-mem2 mem -t {threads} -R '{params.rg}' {GENOME} {input.r1} {input.r2} | \
+        samtools fixmate -m -@ 4 - {output.bam}
+        """
+
+rule sort_markdup:
+    input:
+        bam = str(OUTDIR / "alignment" / "{sample}.namesorted.bam"),
+    output:
+        bam = str(OUTDIR / "alignment" / "{sample}.markdup.bam"),
+        bai = str(OUTDIR / "alignment" / "{sample}.markdup.bam.bai"),
+    threads: 4
+    resources:
+        mem_mb = 16 * 1024,
+    conda: "envs/align.yaml"
+    shell:
+        """
+        samtools sort -@ {threads} -m 2G {input.bam} | \
+        samtools markdup -@ {threads} --write-index - {output.bam}
+        """
+
+rule flagstat:
+    input:
+        bam = str(OUTDIR / "alignment" / "{sample}.markdup.bam"),
+    output:
+        str(OUTDIR / "alignment" / "{sample}.markdup.flagstat"),
+    conda: "envs/align.yaml"
+    shell: "samtools flagstat {input.bam} > {output}"
+
+# ── DeepVariant: per-sample gVCF ─────────────────────────────────────────────
+# GPU path  : Docker image with --gpus all (NVIDIA Ada 6000, CUDA 12)
+# CPU path  : conda deepvariant package (set use_gpu: false in config)
+#
+# Docker bind-mounts: each parent dir is mounted at its own host path inside the
+# container, so --ref / --reads paths are identical inside and outside.
+if USE_GPU:
+    rule deepvariant:
+        input:
+            bam = str(OUTDIR / "alignment" / "{sample}.markdup.bam"),
+            bai = str(OUTDIR / "alignment" / "{sample}.markdup.bam.bai"),
+            ref = GENOME,
+            fai = GENOME_FAI,
+        output:
+            vcf  = str(OUTDIR / "gvcf" / "{sample}.vcf.gz"),
+            gvcf = str(OUTDIR / "gvcf" / "{sample}.g.vcf.gz"),
+            idx  = str(OUTDIR / "gvcf" / "{sample}.g.vcf.gz.tbi"),
+        params:
+            dv_image = DV_IMAGE,
+            outdir   = str(OUTDIR / "gvcf"),
+            tmp_dir  = str(OUTDIR / "gvcf" / "{sample}_tmp"),
+            ploidy   = PLOIDY,
+        threads: THREADS
+        resources:
+            mem_mb = MEM_GB * 1024,
+        conda: "envs/deepvariant.yaml"   # provides tabix only
+        shell:
+            """
+            set -euo pipefail
+            mkdir -p {params.outdir} {params.tmp_dir}
+
+            REF_REAL=$(realpath {input.ref})
+            BAM_REAL=$(realpath {input.bam})
+            OUT_REAL=$(realpath {params.outdir})
+            TMP_REAL=$(realpath {params.tmp_dir})
+            REF_DIR=$(dirname $REF_REAL)
+            BAM_DIR=$(dirname $BAM_REAL)
+
+            docker run --rm --gpus all \
+                -v "$REF_DIR:$REF_DIR:ro" \
+                -v "$BAM_DIR:$BAM_DIR:ro" \
+                -v "$OUT_REAL:$OUT_REAL" \
+                -v "$TMP_REAL:$TMP_REAL" \
+                {params.dv_image} \
+                /opt/deepvariant/bin/run_deepvariant \
+                    --model_type=WGS \
+                    --ref=$REF_REAL \
+                    --reads=$BAM_REAL \
+                    --output_vcf=$OUT_REAL/{wildcards.sample}.vcf.gz \
+                    --output_gvcf=$OUT_REAL/{wildcards.sample}.g.vcf.gz \
+                    --num_shards={threads} \
+                    --intermediate_results_dir=$TMP_REAL
+
+            tabix -p vcf {output.gvcf}
+            rm -rf {params.tmp_dir}
+            """
+else:
+    rule deepvariant:
+        input:
+            bam = str(OUTDIR / "alignment" / "{sample}.markdup.bam"),
+            bai = str(OUTDIR / "alignment" / "{sample}.markdup.bam.bai"),
+            ref = GENOME,
+            fai = GENOME_FAI,
+        output:
+            vcf  = str(OUTDIR / "gvcf" / "{sample}.vcf.gz"),
+            gvcf = str(OUTDIR / "gvcf" / "{sample}.g.vcf.gz"),
+            idx  = str(OUTDIR / "gvcf" / "{sample}.g.vcf.gz.tbi"),
+        params:
+            ploidy  = PLOIDY,
+            tmp_dir = str(OUTDIR / "gvcf" / "{sample}_tmp"),
+        threads: THREADS
+        resources:
+            mem_mb = MEM_GB * 1024,
+        conda: "envs/deepvariant_cpu.yaml"
+        shell:
+            """
+            mkdir -p {params.tmp_dir}
+            run_deepvariant \
+                --model_type=WGS \
+                --ref={input.ref} \
+                --reads={input.bam} \
+                --output_vcf={output.vcf} \
+                --output_gvcf={output.gvcf} \
+                --num_shards={threads} \
+                --intermediate_results_dir={params.tmp_dir}
+            tabix -p vcf {output.gvcf}
+            rm -rf {params.tmp_dir}
+            """
+
+# ── GLnexus: joint genotyping across all samples ──────────────────────────────
+# Streams BCF to stdout → bcftools converts to VCF.gz
+rule glnexus:
+    input:
+        gvcfs = expand(str(OUTDIR / "gvcf" / "{sample}.g.vcf.gz"), sample=SAMPLES),
+    output:
+        vcf   = str(OUTDIR / "vcf" / "joint" / "all_samples.vcf.gz"),
+        tbi   = str(OUTDIR / "vcf" / "joint" / "all_samples.vcf.gz.tbi"),
+    params:
+        db    = str(OUTDIR / "glnexus_db"),
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/joint.yaml"
+    shell:
+        """
+        rm -rf {params.db}
+        mkdir -p $(dirname {output.vcf})
+        glnexus_cli \
+            --config DeepVariant \
+            --dir {params.db} \
+            --threads {threads} \
+            {input.gvcfs} | \
+        bcftools view --output-type z --output {output.vcf}
+        tabix -p vcf {output.vcf}
+        """
+
+# ── Filter by GQ and DP, then separate SNPs / INDELs ─────────────────────────
+# DeepVariant outputs calibrated quality; GQ+DP is sufficient — no complex
+# hard-filter expressions needed.
+rule filter_variants:
+    input:
+        vcf = str(OUTDIR / "vcf" / "joint" / "all_samples.vcf.gz"),
+    output:
+        all_filt = temp(str(OUTDIR / "vcf" / "filtered" / "all.filtered.vcf.gz")),
+        snps     = str(OUTDIR / "vcf" / "filtered" / "snps.PASS.vcf.gz"),
+        indels   = str(OUTDIR / "vcf" / "filtered" / "indels.PASS.vcf.gz"),
+    params:
+        gq = MIN_GQ,
+        dp = MIN_DP,
+    conda: "envs/joint.yaml"
+    shell:
+        """
+        mkdir -p $(dirname {output.snps})
+
+        # Apply GQ and DP soft-filters (adds FILTER tag, does not discard)
+        bcftools filter \
+            -s LowGQ -e "FORMAT/GQ < {params.gq}" \
+            {input.vcf} | \
+        bcftools filter \
+            -s LowDP -m + -e "FORMAT/DP < {params.dp}" \
+            --output-type z --output {output.all_filt}
+        tabix -p vcf {output.all_filt}
+
+        # Extract PASS SNPs
+        bcftools view --type snps -f PASS \
+            --output-type z --output {output.snps} {output.all_filt}
+        tabix -p vcf {output.snps}
+
+        # Extract PASS INDELs
+        bcftools view --type indels -f PASS \
+            --output-type z --output {output.indels} {output.all_filt}
+        tabix -p vcf {output.indels}
+        """
+
+# ── SNPeff: build custom DB + annotate ────────────────────────────────────────
+if ANNOT_FILE:
+    rule build_snpeff_db:
+        input:
+            genome = GENOME,
+            annot  = ANNOT_FILE,
+        output:
+            flag   = str(OUTDIR / "snpeff_db" / ".db_built"),
+        params:
+            species    = SPECIES_NAME,
+            dbdir      = str(OUTDIR / "snpeff_db"),
+            annot_type = ANNOT_TYPE,
+        conda: "envs/annotation.yaml"
+        shell:
+            """
+            mkdir -p {params.dbdir}/{params.species}
+            ln -sf $(realpath {input.genome}) {params.dbdir}/{params.species}/sequences.fa
+            ln -sf $(realpath {input.annot})  {params.dbdir}/{params.species}/genes.{params.annot_type}
+
+            CONFIG={params.dbdir}/snpEff.config
+            if ! grep -q "^{params.species}.genome" "$CONFIG" 2>/dev/null; then
+                echo "{params.species}.genome : {params.species}" >> "$CONFIG"
+            fi
+
+            snpEff build \
+                -dataDir {params.dbdir} \
+                -{params.annot_type} \
+                -v {params.species} \
+                -config "$CONFIG"
+
+            touch {output.flag}
+            """
+
+    rule snpeff_annotate:
+        input:
+            vcf  = str(OUTDIR / "vcf" / "filtered" / "snps.PASS.vcf.gz"),
+            flag = str(OUTDIR / "snpeff_db" / ".db_built"),
+        output:
+            vcf  = str(OUTDIR / "annotation" / "snps.annotated.vcf.gz"),
+            html = str(OUTDIR / "annotation" / "snpeff_summary.html"),
+            csv  = str(OUTDIR / "annotation" / "snpeff_genes.csv"),
+        params:
+            species = SPECIES_NAME,
+            dbdir   = str(OUTDIR / "snpeff_db"),
+            config  = str(OUTDIR / "snpeff_db" / "snpEff.config"),
+        conda: "envs/annotation.yaml"
+        shell:
+            """
+            mkdir -p $(dirname {output.vcf})
+            snpEff ann \
+                -dataDir {params.dbdir} \
+                -config  {params.config} \
+                -v {params.species} \
+                -stats {output.html} \
+                -csvStats {output.csv} \
+                {input.vcf} | bgzip -c > {output.vcf}
+            tabix -p vcf {output.vcf}
+            """
+
+# ── Summary statistics ────────────────────────────────────────────────────────
+rule variant_stats:
+    input:
+        snps   = str(OUTDIR / "vcf" / "filtered" / "snps.PASS.vcf.gz"),
+        indels = str(OUTDIR / "vcf" / "filtered" / "indels.PASS.vcf.gz"),
+    output:
+        str(OUTDIR / "stats" / "variant_summary.txt"),
+    conda: "envs/joint.yaml"
+    shell:
+        """
+        mkdir -p $(dirname {output})
+        {{
+            echo "=== PASS SNPs ==="
+            bcftools stats {input.snps}  | grep "^SN"
+            echo ""
+            echo "=== Ts/Tv ratio (SNPs) ==="
+            bcftools stats {input.snps}  | grep "^TSTV"
+            echo ""
+            echo "=== PASS INDELs ==="
+            bcftools stats {input.indels} | grep "^SN"
+            echo ""
+            echo "=== Per-sample SNP counts ==="
+            bcftools stats -s- {input.snps} | grep "^PSC"
+        }} > {output}
+        """

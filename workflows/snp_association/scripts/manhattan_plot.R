@@ -1,0 +1,132 @@
+# Snakemake script: Manhattan plots (GWAS + Fst), QQ plot, PCA plot
+suppressPackageStartupMessages({
+    library(data.table)
+    library(CMplot)
+    library(ggplot2)
+    library(dplyr)
+})
+
+gwas_file   <- snakemake@input[["gwas"]]
+fst_snp_file<- snakemake@input[["fst_snp"]]
+fst_win_file<- snakemake@input[["fst_win"]]
+pca_file    <- snakemake@input[["pca_vec"]]
+pheno_file  <- snakemake@input[["pheno"]]
+
+mht_gwas    <- snakemake@output[["mht_gwas"]]
+mht_fst     <- snakemake@output[["mht_fst"]]
+qq_out      <- snakemake@output[["qq"]]
+pca_out     <- snakemake@output[["pca_plot"]]
+
+gwas_p      <- as.numeric(snakemake@params[["gwas_p"]])
+suggestive  <- as.numeric(snakemake@params[["suggestive"]])
+fst_top_pct <- as.numeric(snakemake@params[["fst_top"]])
+outdir      <- snakemake@params[["outdir"]]
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. GWAS Manhattan + QQ ────────────────────────────────────────────────────
+message("[plots] Reading GEMMA output: ", gwas_file)
+gwas <- fread(gwas_file)
+
+# GEMMA .assoc.txt columns: chr rs ps n_miss allele1 allele0 af beta se logl_H1 l_remle p_wald p_lrt p_score
+# CMplot expects: SNP, Chr, Pos, P
+# Use p_lrt as primary (most powerful of the three GEMMA tests)
+gwas_plt <- gwas[, .(SNP = rs, Chr = chr, Pos = ps, P = p_lrt)]
+gwas_plt <- gwas_plt[!is.na(P) & P > 0]
+
+# Genomic inflation factor λ
+chi2   <- qchisq(1 - gwas_plt$P, df = 1)
+lambda <- round(median(chi2, na.rm = TRUE) / qchisq(0.5, 1), 3)
+message(sprintf("[plots] Genomic inflation factor λ = %.3f", lambda))
+writeLines(sprintf("lambda = %.3f", lambda), file.path(outdir, "lambda.txt"))
+
+# Manhattan plot
+message("[plots] Drawing GWAS Manhattan plot")
+CMplot(
+    gwas_plt,
+    type            = "p",
+    plot.type       = "m",
+    threshold       = c(gwas_p, suggestive),
+    threshold.lwd   = c(1, 1),
+    threshold.lty   = c(1, 2),
+    threshold.col   = c("red", "blue"),
+    amplify         = TRUE,
+    signal.cex      = 1.5,
+    signal.pch      = 19,
+    signal.col      = "red",
+    file            = "pdf",
+    file.name       = "manhattan_gwas",
+    dpi             = 300,
+    file.output     = TRUE,
+    output.file.name= file.path(outdir, "manhattan_gwas"),
+    verbose         = FALSE
+)
+# CMplot writes to working dir; move if needed
+if (!file.exists(mht_gwas)) {
+    cand <- list.files(".", pattern = "manhattan_gwas.*\\.pdf", full.names = TRUE)
+    if (length(cand)) file.rename(cand[1], mht_gwas)
+}
+
+# QQ plot
+message("[plots] Drawing QQ plot")
+pdf(qq_out, width = 6, height = 6)
+CMplot(
+    gwas_plt,
+    type      = "p",
+    plot.type = "q",
+    conf.int  = TRUE,
+    conf.int.col = "#00000033",
+    file.output = FALSE,
+    verbose = FALSE
+)
+title(sub = sprintf("λ = %.3f", lambda), cex.sub = 0.9)
+dev.off()
+
+# ── 2. Fst Manhattan ─────────────────────────────────────────────────────────
+message("[plots] Reading per-SNP Fst: ", fst_snp_file)
+fst <- fread(fst_snp_file)
+# VCFtools output: CHROM POS WEIR_AND_COCKERHAM_FST
+setnames(fst, c("CHROM", "POS", "FST"))
+fst <- fst[!is.na(FST) & FST >= 0]
+
+fst_threshold <- quantile(fst$FST, fst_top_pct / 100, na.rm = TRUE)
+message(sprintf("[plots] Fst top %g%% threshold = %.4f", 100 - fst_top_pct, fst_threshold))
+writeLines(sprintf("fst_outlier_threshold = %.4f", fst_threshold), file.path(outdir, "fst_threshold.txt"))
+
+fst_plt <- fst[, .(SNP = paste0(CHROM, ":", POS), Chr = CHROM, Pos = POS, FST = FST)]
+
+pdf(mht_fst, width = 14, height = 5)
+CMplot(
+    fst_plt,
+    type            = "p",
+    plot.type       = "m",
+    threshold       = fst_threshold,
+    threshold.lwd   = 1,
+    threshold.lty   = 1,
+    threshold.col   = "red",
+    amplify         = TRUE,
+    signal.col      = "red",
+    ylab            = expression(F[ST]),
+    file.output     = FALSE,
+    verbose         = FALSE
+)
+title(main = "Per-SNP Fst (salt-tolerant vs intolerant)")
+dev.off()
+
+# ── 3. PCA plot ───────────────────────────────────────────────────────────────
+message("[plots] Drawing PCA plot")
+pca  <- fread(pca_file)
+setnames(pca, c("FID", "IID", paste0("PC", seq_len(ncol(pca) - 2))))
+
+pheno <- fread(pheno_file, header = FALSE, col.names = c("IID", "phenotype"))
+pca   <- merge(pca, pheno, by = "IID", all.x = TRUE)
+pca[, group := ifelse(phenotype == 1, "Salt-tolerant", "Salt-intolerant")]
+
+p <- ggplot(pca, aes(PC1, PC2, colour = group, label = IID)) +
+    geom_point(size = 3, alpha = 0.8) +
+    scale_colour_manual(values = c("Salt-tolerant" = "#e41a1c", "Salt-intolerant" = "#377eb8")) +
+    theme_bw(base_size = 13) +
+    labs(title = "PCA — population structure", colour = "Group",
+         x = "PC1", y = "PC2")
+ggsave(pca_out, p, width = 7, height = 5)
+
+message("[plots] Done. Output: ", outdir)

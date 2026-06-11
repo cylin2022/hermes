@@ -1,0 +1,5 @@
+sample,group,r1,r2
+ctrl_rep1,control,/path/to/ctrl_rep1_R1.fastq.gz,/path/to/ctrl_rep1_R2.fastq.gz
+ctrl_rep2,control,/path/to/ctrl_rep2_R1.fastq.gz,/path/to/ctrl_rep2_R2.fastq.gz
+trt_rep1,treatment,/path/to/trt_rep1_R1.fastq.gz,/path/to/trt_rep1_R2.fastq.gz
+trt_rep2,treatment,/path/to/trt_rep2_R1.fastq.gz,/path/to/trt_rep2_R2.fastq.gz

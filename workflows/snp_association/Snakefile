@@ -1,0 +1,315 @@
+"""
+SNP-trait association analysis — binary phenotype, related individuals
+Designed for: 60 tilapia WGS samples (30 salt-tolerant vs 30 intolerant)
+
+Three complementary analyses:
+  A) Fst outlier scan             — allele-frequency divergence between groups
+  B) GWAS covariate-adjusted      — GEMMA LMM, salt tolerance phenotype, body size as covariate
+                                    isolates salt-tolerance-specific genetic effects
+  C) GWAS body size               — GEMMA LMM, body weight as phenotype
+                                    identifies growth QTLs
+
+SNP classification:
+  salt-specific   : significant in B, not C  → true salt tolerance candidates
+  size-specific   : significant in C, not B  → growth QTLs (confounders)
+  pleiotropic     : significant in both B+C  → genes affecting both traits
+
+Input: filtered VCF from wgs_snp workflow + metadata CSV (sample_id, phenotype, covariates)
+"""
+
+from pathlib import Path
+import csv as _csv
+
+# ── Config ────────────────────────────────────────────────────────────────────
+INPUT_VCF    = config["input_vcf"]
+METADATA     = config["metadata_file"]   # CSV: sample_id, phenotype, [weight_g, length_cm, ...]
+OUTDIR       = Path(config["outdir"])
+GENOME_FA    = config["genome_fasta"]
+ANNOT_FILE   = config.get("gtf", config.get("gff", ""))
+SPECIES_NAME = config.get("species_name", "tilapia")
+
+# Any column beyond sample_id + phenotype is treated as a covariate
+def _has_covariates(path):
+    with open(path) as fh:
+        cols = next(_csv.reader(fh))
+    return len(cols) > 2
+
+HAS_COV = _has_covariates(METADATA)
+
+# QC filters
+MAF          = float(config.get("maf", 0.05))
+GENO         = float(config.get("geno", 0.1))
+MIND         = float(config.get("mind", 0.1))
+HWE_P        = float(config.get("hwe", 1e-4))   # relaxed for 10× coverage
+
+# Fst
+FST_WIN      = int(config.get("fst_window_size", 50000))
+FST_STEP     = int(config.get("fst_window_step", 5000))
+FST_TOP_PCT  = float(config.get("fst_top_pct", 99))
+
+# GWAS thresholds
+GWAS_P       = float(config.get("gwas_threshold", 5e-8))
+SUGGESTIVE_P = float(config.get("suggestive_threshold", 1e-5))
+
+FLANK_BP     = int(config.get("candidate_flank_bp", 10000))
+N_PCS        = int(config.get("n_pcs", 10))
+THREADS      = int(config.get("threads", 16))
+
+PFX          = str(OUTDIR / "plink" / "tilapia")
+
+# ── Target rule ───────────────────────────────────────────────────────────────
+rule all:
+    input:
+        str(OUTDIR / "pca" / "pca.eigenvec"),
+        str(OUTDIR / "fst" / "persnp.weir.fst"),
+        str(OUTDIR / "fst" / "window.windowed.weir.fst"),
+        str(OUTDIR / "gwas" / "salt_adjusted.assoc.txt"),
+        str(OUTDIR / "gwas" / "bodysize.assoc.txt") if HAS_COV else [],
+        str(OUTDIR / "plots" / "manhattan_gwas.pdf"),
+        str(OUTDIR / "plots" / "manhattan_fst.pdf"),
+        str(OUTDIR / "plots" / "qq_plot.pdf"),
+        str(OUTDIR / "annotation" / "candidate_snps.csv"),
+        str(OUTDIR / "annotation" / "candidate_genes.csv"),
+
+# ── Parse phenotype + covariates ─────────────────────────────────────────────
+rule prepare_inputs:
+    input:
+        metadata   = METADATA,
+        vcf        = INPUT_VCF,
+    output:
+        plink_pheno    = str(OUTDIR / "inputs" / "phenotype.txt"),
+        pop_tolerant   = str(OUTDIR / "inputs" / "pop_tolerant.txt"),
+        pop_intolerant = str(OUTDIR / "inputs" / "pop_intolerant.txt"),
+        gemma_cov      = str(OUTDIR / "inputs" / "gemma_covariates.txt"),
+        bodysize_pheno = str(OUTDIR / "inputs" / "bodysize_phenotype.txt"),
+    conda: "envs/plink2.yaml"
+    script: "scripts/prepare_inputs.py"
+
+# ── VCF → PLINK binary + QC ──────────────────────────────────────────────────
+rule vcf_to_plink:
+    input:
+        vcf   = INPUT_VCF,
+        pheno = str(OUTDIR / "inputs" / "phenotype.txt"),
+    output:
+        bed = PFX + ".bed",
+        bim = PFX + ".bim",
+        fam = PFX + ".fam",
+    params:
+        pfx  = PFX,
+        maf  = MAF,
+        geno = GENO,
+        mind = MIND,
+        hwe  = HWE_P,
+    conda: "envs/plink2.yaml"
+    shell:
+        """
+        mkdir -p $(dirname {params.pfx})
+        plink2 \
+            --vcf {input.vcf} \
+            --pheno {input.pheno} \
+            --pheno-name PHENOTYPE \
+            --1 \
+            --make-bed \
+            --out {params.pfx} \
+            --maf {params.maf} \
+            --geno {params.geno} \
+            --mind {params.mind} \
+            --hwe {params.hwe} keep-controls \
+            --allow-extra-chr \
+            --set-all-var-ids '@:#:$r:$a' \
+            --new-id-max-allele-len 100 missing
+        """
+
+# ── LD pruning ────────────────────────────────────────────────────────────────
+rule ld_prune:
+    input:
+        bed = PFX + ".bed",
+        bim = PFX + ".bim",
+        fam = PFX + ".fam",
+    output:
+        keep = str(OUTDIR / "plink" / "pruned.prune.in"),
+        excl = str(OUTDIR / "plink" / "pruned.prune.out"),
+    params:
+        pfx = str(OUTDIR / "plink" / "pruned"),
+        p   = PFX,
+    conda: "envs/plink2.yaml"
+    shell:
+        """
+        plink2 --bfile {params.p} --indep-pairwise 50 10 0.1 \
+               --out {params.pfx} --allow-extra-chr
+        """
+
+# ── PCA ───────────────────────────────────────────────────────────────────────
+rule pca:
+    input:
+        bed  = PFX + ".bed",
+        bim  = PFX + ".bim",
+        fam  = PFX + ".fam",
+        keep = str(OUTDIR / "plink" / "pruned.prune.in"),
+    output:
+        vec  = str(OUTDIR / "pca" / "pca.eigenvec"),
+        val  = str(OUTDIR / "pca" / "pca.eigenval"),
+    params:
+        pfx  = str(OUTDIR / "pca" / "pca"),
+        p    = PFX,
+        n    = N_PCS,
+    conda: "envs/plink2.yaml"
+    shell:
+        """
+        mkdir -p $(dirname {params.pfx})
+        plink2 --bfile {params.p} --extract {input.keep} \
+               --pca {params.n} --out {params.pfx} --allow-extra-chr
+        """
+
+# ── Kinship matrix (GEMMA) ───────────────────────────────────────────────────
+rule kinship:
+    input:
+        bed = PFX + ".bed",
+        bim = PFX + ".bim",
+        fam = PFX + ".fam",
+    output:
+        kin = str(OUTDIR / "gemma" / "kinship.cXX.txt"),
+    params:
+        pfx_in = PFX,
+        outdir = str(OUTDIR / "gemma"),
+    conda: "envs/gemma.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        gemma -bfile {params.pfx_in} -gk 1 -o kinship -outdir {params.outdir}
+        """
+
+# ── GWAS A: salt tolerance adjusted for body size ────────────────────────────
+# -c covariate_file adds weight + length as fixed-effect covariates.
+# This removes the body-size confounding effect, leaving salt-specific signal.
+rule gwas_salt_adjusted:
+    input:
+        bed = PFX + ".bed",
+        bim = PFX + ".bim",
+        fam = PFX + ".fam",
+        kin = str(OUTDIR / "gemma" / "kinship.cXX.txt"),
+        cov = str(OUTDIR / "inputs" / "gemma_covariates.txt"),
+    output:
+        assoc = str(OUTDIR / "gwas" / "salt_adjusted.assoc.txt"),
+    params:
+        pfx_in = PFX,
+        outdir = str(OUTDIR / "gwas"),
+        cov_flag = lambda wc, input: f"-c {input.cov}" if Path(input.cov).stat().st_size > 0 else "",
+    conda: "envs/gemma.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        gemma -bfile {params.pfx_in} -k {input.kin} \
+              {params.cov_flag} \
+              -lmm 4 -o salt_adjusted -outdir {params.outdir}
+        """
+
+# ── GWAS B: body size as phenotype (growth QTL scan) ─────────────────────────
+# Identifies pure growth QTLs — SNPs significant here but not in GWAS A
+# are growth confounders, not salt-tolerance SNPs.
+rule gwas_bodysize:
+    input:
+        bed  = PFX + ".bed",
+        bim  = PFX + ".bim",
+        fam  = PFX + ".fam",
+        kin  = str(OUTDIR / "gemma" / "kinship.cXX.txt"),
+        pheno= str(OUTDIR / "inputs" / "bodysize_phenotype.txt"),
+    output:
+        assoc = str(OUTDIR / "gwas" / "bodysize.assoc.txt"),
+    params:
+        pfx_in = PFX,
+        outdir = str(OUTDIR / "gwas"),
+    conda: "envs/gemma.yaml"
+    shell:
+        """
+        # -n 1: use the phenotype file instead of .fam phenotype column
+        # GEMMA -lmm on continuous phenotype (body weight z-score)
+        gemma -bfile {params.pfx_in} -k {input.kin} \
+              -p {input.pheno} \
+              -lmm 4 -o bodysize -outdir {params.outdir}
+        """
+
+# ── Fst ───────────────────────────────────────────────────────────────────────
+rule fst_persnp:
+    input:
+        vcf  = INPUT_VCF,
+        pop1 = str(OUTDIR / "inputs" / "pop_tolerant.txt"),
+        pop2 = str(OUTDIR / "inputs" / "pop_intolerant.txt"),
+    output:
+        fst  = str(OUTDIR / "fst" / "persnp.weir.fst"),
+        log  = str(OUTDIR / "fst" / "persnp.log"),
+    params:
+        pfx  = str(OUTDIR / "fst" / "persnp"),
+    conda: "envs/plink2.yaml"
+    shell:
+        """
+        mkdir -p $(dirname {params.pfx})
+        vcftools --gzvcf {input.vcf} \
+            --weir-fst-pop {input.pop1} --weir-fst-pop {input.pop2} \
+            --out {params.pfx} 2> {output.log}
+        """
+
+rule fst_window:
+    input:
+        vcf  = INPUT_VCF,
+        pop1 = str(OUTDIR / "inputs" / "pop_tolerant.txt"),
+        pop2 = str(OUTDIR / "inputs" / "pop_intolerant.txt"),
+    output:
+        fst  = str(OUTDIR / "fst" / "window.windowed.weir.fst"),
+        log  = str(OUTDIR / "fst" / "window.log"),
+    params:
+        pfx  = str(OUTDIR / "fst" / "window"),
+        win  = FST_WIN,
+        step = FST_STEP,
+    conda: "envs/plink2.yaml"
+    shell:
+        """
+        vcftools --gzvcf {input.vcf} \
+            --weir-fst-pop {input.pop1} --weir-fst-pop {input.pop2} \
+            --fst-window-size {params.win} --fst-window-step {params.step} \
+            --out {params.pfx} 2> {output.log}
+        """
+
+# ── Plots ─────────────────────────────────────────────────────────────────────
+rule plots:
+    input:
+        gwas_salt    = str(OUTDIR / "gwas" / "salt_adjusted.assoc.txt"),
+        gwas_size    = str(OUTDIR / "gwas" / "bodysize.assoc.txt") if HAS_COV else [],
+        fst_snp      = str(OUTDIR / "fst" / "persnp.weir.fst"),
+        fst_win      = str(OUTDIR / "fst" / "window.windowed.weir.fst"),
+        pca_vec      = str(OUTDIR / "pca" / "pca.eigenvec"),
+        pheno        = PHENOTYPE,
+    output:
+        mht_gwas     = str(OUTDIR / "plots" / "manhattan_gwas.pdf"),
+        mht_fst      = str(OUTDIR / "plots" / "manhattan_fst.pdf"),
+        qq           = str(OUTDIR / "plots" / "qq_plot.pdf"),
+        pca_plot     = str(OUTDIR / "plots" / "pca.pdf"),
+    params:
+        gwas_p       = GWAS_P,
+        suggestive   = SUGGESTIVE_P,
+        fst_top      = FST_TOP_PCT,
+        has_cov      = HAS_COV,
+        outdir       = str(OUTDIR / "plots"),
+    conda: "envs/r_gwas.yaml"
+    script: "scripts/manhattan_plot.R"
+
+# ── Annotate + classify candidate SNPs ───────────────────────────────────────
+rule annotate_hits:
+    input:
+        gwas_salt  = str(OUTDIR / "gwas" / "salt_adjusted.assoc.txt"),
+        gwas_size  = str(OUTDIR / "gwas" / "bodysize.assoc.txt") if HAS_COV else [],
+        fst_snp    = str(OUTDIR / "fst" / "persnp.weir.fst"),
+        annot      = ANNOT_FILE,
+    output:
+        cand_snps  = str(OUTDIR / "annotation" / "candidate_snps.csv"),
+        cand_genes = str(OUTDIR / "annotation" / "candidate_genes.csv"),
+    params:
+        gwas_p      = GWAS_P,
+        suggestive  = SUGGESTIVE_P,
+        fst_top_pct = FST_TOP_PCT,
+        flank_bp    = FLANK_BP,
+        has_cov     = HAS_COV,
+        outdir      = str(OUTDIR / "annotation"),
+        species     = SPECIES_NAME,
+    conda: "envs/plink2.yaml"
+    script: "scripts/annotate_hits.py"

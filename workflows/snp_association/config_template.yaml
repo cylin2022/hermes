@@ -1,0 +1,45 @@
+# SNP Association Analysis Configuration
+# Binary phenotype + related individuals (mixed-model GWAS)
+# Designed for: Taiwan tilapia 30 salt-tolerant vs 30 intolerant (60 total, ~10X WGS)
+
+# ── Input ─────────────────────────────────────────────────────────────────────
+input_vcf: "/path/to/wgs_snp/vcf/filtered/snps.PASS.vcf.gz"
+
+# Metadata CSV: sample_id, phenotype, [covariate columns...]
+# phenotype: 1 = salt-tolerant, 0 = salt-intolerant, NA = missing
+# Covariate columns (weight_g, length_cm, ...) are OPTIONAL but strongly recommended
+# to correct for body-size confounding. If absent, covariate adjustment is skipped.
+# The FIRST covariate column is used as the body-size phenotype for the secondary GWAS.
+# Use samplesheet_template.csv as a starting point.
+metadata_file: "/path/to/metadata.csv"
+
+# ── Reference ─────────────────────────────────────────────────────────────────
+genome_fasta: "/path/to/tilapia_genome.fa"
+gtf: "/path/to/tilapia_annotation.gtf"   # for candidate gene identification
+gff: ""                                   # alternative to gtf
+species_name: "tilapia"
+
+# ── QC filters ────────────────────────────────────────────────────────────────
+maf: 0.05              # minimum allele frequency; with n=60 this is 3 minor allele copies
+geno: 0.1              # max SNP missingness (10%)
+mind: 0.1              # max sample missingness (10%)
+hwe: 1.0e-4            # HWE p-value threshold (relaxed for 10× coverage)
+
+# ── Fst parameters ────────────────────────────────────────────────────────────
+fst_window_size: 50000  # 50 kb sliding window (appropriate for tilapia short LD)
+fst_window_step: 5000   # 5 kb step
+fst_top_pct: 99         # top 1% Fst SNPs flagged as outliers
+
+# ── GWAS thresholds ───────────────────────────────────────────────────────────
+gwas_threshold: 5.0e-8     # Bonferroni for ~1M independent SNPs (tilapia 1 Gb)
+suggestive_threshold: 1.0e-5
+
+# ── Candidate gene annotation ─────────────────────────────────────────────────
+candidate_flank_bp: 10000  # search ±10 kb around each significant SNP
+
+# ── Other ─────────────────────────────────────────────────────────────────────
+n_pcs: 10
+threads: 16
+
+# ── Output ───────────────────────────────────────────────────────────────────
+outdir: "/path/to/output"

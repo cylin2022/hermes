@@ -1,0 +1,10 @@
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - plink2=2.00a5.12
+  - vcftools=0.1.16
+  - bcftools=1.19
+  - htslib=1.19
+  - bedtools=2.31

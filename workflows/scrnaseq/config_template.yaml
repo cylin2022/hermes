@@ -1,0 +1,42 @@
+# scRNA-seq Workflow Configuration Template
+# Pass these values via run_workflow(config={...}) or as a config.yaml
+
+# ── Input ─────────────────────────────────────────────────────────────────────
+# CSV with header: sample,r1,r2
+# R1 = barcode+UMI file; R2 = cDNA file (10x Chromium convention)
+# Use the template at samplesheet_template.csv as a starting point.
+samplesheet: "/path/to/samplesheet.csv"
+
+# ── Reference ─────────────────────────────────────────────────────────────────
+genome_fasta: "/path/to/genome.fa"
+genome_gtf:   "/path/to/annotation.gtf"
+star_index:   ""                       # leave empty to build automatically; or path to pre-built
+
+# ── Library chemistry ─────────────────────────────────────────────────────────
+chemistry: "10xv3"                     # 10xv2 | 10xv3 | dropseq
+expected_cells: 5000
+
+# ── Mitochondrial genes ───────────────────────────────────────────────────────
+# Gene ID prefix that marks mitochondrial genes (used for QC)
+mt_gene_prefix: "MT-"                  # MT- human/mouse | mt: fly/worm | Mt: plant
+
+# ── QC thresholds ────────────────────────────────────────────────────────────
+min_genes: 200                         # minimum genes per cell
+max_genes: 6000                        # maximum genes per cell (remove potential multiplets)
+max_mt_pct: 20                         # maximum % mitochondrial reads
+
+# ── Clustering ────────────────────────────────────────────────────────────────
+n_hvg: 3000                            # highly variable genes for PCA
+n_pcs: 50
+resolution: 0.5                        # Leiden resolution (higher = more clusters)
+
+# ── STAR index (for non-standard genomes) ────────────────────────────────────
+star_sa_index_nbases: 14               # reduce for small genomes:
+                                       # ~13 for 300 Mb | ~11 for 50 Mb | ~9 for 5 Mb
+
+# ── Resources ────────────────────────────────────────────────────────────────
+threads: 16
+mem_gb: 128
+
+# ── Output ───────────────────────────────────────────────────────────────────
+outdir: "/path/to/output"

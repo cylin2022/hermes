@@ -1,0 +1,24 @@
+# Workflow runs and outputs
+runs/
+logs/
+
+# Local config (may contain machine-specific paths)
+config/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.env
+
+# Snakemake
+.snakemake/
+*.snakemake.log
+
+# Conda envs (built locally)
+.conda/
+
+# Misc
+.DS_Store
+*.swp

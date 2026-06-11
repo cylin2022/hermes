@@ -1,0 +1,7 @@
+# GPU path: Docker handles DeepVariant; this env only provides tabix for indexing.
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - htslib=1.19   # tabix + bgzip

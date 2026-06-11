@@ -1,0 +1,12 @@
+channels:
+  - bioconda
+  - conda-forge
+  - r
+  - defaults
+dependencies:
+  - r-base=4.3
+  - r-data.table
+  - r-ggplot2
+  - r-cmplot
+  - r-dplyr
+  - r-readr

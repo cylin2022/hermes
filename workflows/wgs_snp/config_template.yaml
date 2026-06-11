@@ -1,0 +1,37 @@
+# WGS SNP/INDEL Calling Configuration Template
+# Variant caller: DeepVariant + GLnexus (non-model organism optimised)
+# Pass these values via run_workflow(config={...}) or as a config.yaml
+
+# ── Input ─────────────────────────────────────────────────────────────────────
+# CSV with header: sample,r1,r2
+# Use the template at samplesheet_template.csv as a starting point.
+samplesheet: "/path/to/samplesheet.csv"
+
+# ── Reference ─────────────────────────────────────────────────────────────────
+genome_fasta: "/path/to/genome.fa"
+species_name: "my_species"            # alphanumeric + underscore only (SNPeff DB name)
+
+# ── Annotation (for SNPeff; leave both empty to skip annotation step) ─────────
+gtf: "/path/to/annotation.gtf"        # preferred
+gff: ""                               # alternative if no GTF
+
+# ── Variant calling ───────────────────────────────────────────────────────────
+ploidy: 2                             # 2 = diploid (production); polyploid = experimental in DV v1.6
+
+# ── GPU / Docker settings ─────────────────────────────────────────────────────
+use_gpu: true                         # true = run DeepVariant via Docker + --gpus all (recommended)
+                                      # false = use conda CPU package (slow, no Docker needed)
+dv_docker_image: "google/deepvariant:1.6.1"   # override to pin a specific version
+
+# ── Quality filters ───────────────────────────────────────────────────────────
+# DeepVariant outputs calibrated quality scores; simple GQ+DP filter is sufficient.
+# No QD / FS / MQ hard-filter thresholds needed.
+min_gq: 20                            # minimum genotype quality (Phred-scaled)
+min_depth: 5                          # minimum read depth at variant site
+
+# ── Resources ────────────────────────────────────────────────────────────────
+threads: 16
+mem_gb: 64                            # DeepVariant is memory-intensive; ≥32 GB recommended
+
+# ── Output ───────────────────────────────────────────────────────────────────
+outdir: "/path/to/output"

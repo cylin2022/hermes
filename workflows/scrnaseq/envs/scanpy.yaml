@@ -1,0 +1,16 @@
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - scanpy>=1.9
+  - anndata
+  - leidenalg
+  - python-igraph
+  - matplotlib
+  - seaborn
+  - pandas
+  - numpy
+  - scipy
+  - scikit-learn
