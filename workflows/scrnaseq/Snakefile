@@ -124,7 +124,7 @@ rule starsolo:
         matrix   = str(OUTDIR / "starsolo" / "{sample}" / "Solo.out" / "Gene" / "filtered" / "matrix.mtx"),
         barcodes = str(OUTDIR / "starsolo" / "{sample}" / "Solo.out" / "Gene" / "filtered" / "barcodes.tsv"),
         features = str(OUTDIR / "starsolo" / "{sample}" / "Solo.out" / "Gene" / "filtered" / "features.tsv"),
-        bam      = str(OUTDIR / "starsolo" / "{sample}" / "Aligned.sortedByCoord.out.bam"),
+        bam      = temp(str(OUTDIR / "starsolo" / "{sample}" / "Aligned.sortedByCoord.out.bam")),
         log      = str(OUTDIR / "starsolo" / "{sample}" / "Log.final.out"),
     params:
         outpfx = str(OUTDIR / "starsolo" / "{sample}") + "/",
@@ -159,6 +159,9 @@ rule doublet_detection:
         scores  = str(OUTDIR / "doublets" / "{sample}_doublet_scores.csv"),
     params:
         sample  = "{sample}",
+    threads: 8
+    resources:
+        mem_mb = 16 * 1024,
     conda: "envs/r_scrna.yaml"
     script: "scripts/doublet_detection.R"
 

@@ -15,7 +15,8 @@ colnames(sce) <- paste0(sample_id, "_", colnames(sce))
 
 message("[scDblFinder] Running doublet detection on ", ncol(sce), " cells")
 set.seed(42)
-sce <- scDblFinder(sce, BPPARAM = SerialParam())
+nworkers <- if (!is.null(snakemake@threads)) as.integer(snakemake@threads) else 4L
+sce <- scDblFinder(sce, BPPARAM = MulticoreParam(workers = nworkers))
 
 df <- data.frame(
     barcode        = colnames(sce),

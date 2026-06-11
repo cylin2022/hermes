@@ -30,8 +30,8 @@ min_gq: 20                            # minimum genotype quality (Phred-scaled)
 min_depth: 5                          # minimum read depth at variant site
 
 # ── Resources ────────────────────────────────────────────────────────────────
-threads: 16
-mem_gb: 64                            # DeepVariant is memory-intensive; ≥32 GB recommended
+threads: 64
+mem_gb: 256                           # DeepVariant with 64 shards peaks at ~4 GB/shard; 256 GB covers 64 shards
 
 # ── Output ───────────────────────────────────────────────────────────────────
 outdir: "/path/to/output"

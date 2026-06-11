@@ -73,7 +73,7 @@ rule fastp:
         r2   = str(OUTDIR / "trimmed" / "{sample}_R2.fastq.gz"),
         html = str(OUTDIR / "fastp" / "{sample}.html"),
         json = str(OUTDIR / "fastp" / "{sample}.json"),
-    threads: 8
+    threads: 16
     conda: "envs/qc.yaml"
     shell:
         """
@@ -129,18 +129,18 @@ rule bwa_mem2:
     shell:
         """
         bwa-mem2 mem -t {threads} -R '{params.rg}' {GENOME} {input.r1} {input.r2} | \
-        samtools fixmate -m -@ 4 - {output.bam}
+        samtools fixmate -m -@ {threads} - {output.bam}
         """
 
 rule sort_markdup:
     input:
         bam = str(OUTDIR / "alignment" / "{sample}.namesorted.bam"),
     output:
-        bam = str(OUTDIR / "alignment" / "{sample}.markdup.bam"),
-        bai = str(OUTDIR / "alignment" / "{sample}.markdup.bam.bai"),
-    threads: 4
+        bam = temp(str(OUTDIR / "alignment" / "{sample}.markdup.bam")),
+        bai = temp(str(OUTDIR / "alignment" / "{sample}.markdup.bam.bai")),
+    threads: 8
     resources:
-        mem_mb = 16 * 1024,
+        mem_mb = 32 * 1024,
     conda: "envs/align.yaml"
     shell:
         """
@@ -153,8 +153,9 @@ rule flagstat:
         bam = str(OUTDIR / "alignment" / "{sample}.markdup.bam"),
     output:
         str(OUTDIR / "alignment" / "{sample}.markdup.flagstat"),
+    threads: 4
     conda: "envs/align.yaml"
-    shell: "samtools flagstat {input.bam} > {output}"
+    shell: "samtools flagstat -@ {threads} {input.bam} > {output}"
 
 # ── DeepVariant: per-sample gVCF ─────────────────────────────────────────────
 # GPU path  : Docker image with --gpus all (NVIDIA Ada 6000, CUDA 12)
@@ -181,6 +182,7 @@ if USE_GPU:
         threads: THREADS
         resources:
             mem_mb = MEM_GB * 1024,
+            gpu    = 1,
         conda: "envs/deepvariant.yaml"   # provides tabix only
         shell:
             """
@@ -267,8 +269,9 @@ rule glnexus:
             --config DeepVariant \
             --dir {params.db} \
             --threads {threads} \
+            --mem-gbytes {MEM_GB} \
             {input.gvcfs} | \
-        bcftools view --output-type z --output {output.vcf}
+        bcftools view --output-type z --threads 4 --output {output.vcf}
         tabix -p vcf {output.vcf}
         """
 
@@ -359,7 +362,7 @@ if ANNOT_FILE:
         shell:
             """
             mkdir -p $(dirname {output.vcf})
-            snpEff ann \
+            snpEff ann -Xmx16g \
                 -dataDir {params.dbdir} \
                 -config  {params.config} \
                 -v {params.species} \

@@ -100,6 +100,9 @@ rule vcf_to_plink:
         geno = GENO,
         mind = MIND,
         hwe  = HWE_P,
+    threads: THREADS
+    resources:
+        mem_mb = 16 * 1024,
     conda: "envs/plink2.yaml"
     shell:
         """
@@ -110,6 +113,7 @@ rule vcf_to_plink:
             --pheno-name PHENOTYPE \
             --1 \
             --make-bed \
+            --threads {threads} \
             --out {params.pfx} \
             --maf {params.maf} \
             --geno {params.geno} \
@@ -132,10 +136,11 @@ rule ld_prune:
     params:
         pfx = str(OUTDIR / "plink" / "pruned"),
         p   = PFX,
+    threads: THREADS
     conda: "envs/plink2.yaml"
     shell:
         """
-        plink2 --bfile {params.p} --indep-pairwise 50 10 0.1 \
+        plink2 --bfile {params.p} --threads {threads} --indep-pairwise 50 10 0.1 \
                --out {params.pfx} --allow-extra-chr
         """
 
@@ -153,11 +158,12 @@ rule pca:
         pfx  = str(OUTDIR / "pca" / "pca"),
         p    = PFX,
         n    = N_PCS,
+    threads: THREADS
     conda: "envs/plink2.yaml"
     shell:
         """
         mkdir -p $(dirname {params.pfx})
-        plink2 --bfile {params.p} --extract {input.keep} \
+        plink2 --bfile {params.p} --threads {threads} --extract {input.keep} \
                --pca {params.n} --out {params.pfx} --allow-extra-chr
         """
 
@@ -172,6 +178,8 @@ rule kinship:
     params:
         pfx_in = PFX,
         outdir = str(OUTDIR / "gemma"),
+    resources:
+        mem_mb = 32 * 1024,
     conda: "envs/gemma.yaml"
     shell:
         """
@@ -195,6 +203,8 @@ rule gwas_salt_adjusted:
         pfx_in = PFX,
         outdir = str(OUTDIR / "gwas"),
         cov_flag = lambda wc, input: f"-c {input.cov}" if Path(input.cov).stat().st_size > 0 else "",
+    resources:
+        mem_mb = 32 * 1024,
     conda: "envs/gemma.yaml"
     shell:
         """
@@ -207,27 +217,30 @@ rule gwas_salt_adjusted:
 # ── GWAS B: body size as phenotype (growth QTL scan) ─────────────────────────
 # Identifies pure growth QTLs — SNPs significant here but not in GWAS A
 # are growth confounders, not salt-tolerance SNPs.
-rule gwas_bodysize:
-    input:
-        bed  = PFX + ".bed",
-        bim  = PFX + ".bim",
-        fam  = PFX + ".fam",
-        kin  = str(OUTDIR / "gemma" / "kinship.cXX.txt"),
-        pheno= str(OUTDIR / "inputs" / "bodysize_phenotype.txt"),
-    output:
-        assoc = str(OUTDIR / "gwas" / "bodysize.assoc.txt"),
-    params:
-        pfx_in = PFX,
-        outdir = str(OUTDIR / "gwas"),
-    conda: "envs/gemma.yaml"
-    shell:
-        """
-        # -n 1: use the phenotype file instead of .fam phenotype column
-        # GEMMA -lmm on continuous phenotype (body weight z-score)
-        gemma -bfile {params.pfx_in} -k {input.kin} \
-              -p {input.pheno} \
-              -lmm 4 -o bodysize -outdir {params.outdir}
-        """
+if HAS_COV:
+    rule gwas_bodysize:
+        input:
+            bed  = PFX + ".bed",
+            bim  = PFX + ".bim",
+            fam  = PFX + ".fam",
+            kin  = str(OUTDIR / "gemma" / "kinship.cXX.txt"),
+            pheno= str(OUTDIR / "inputs" / "bodysize_phenotype.txt"),
+        output:
+            assoc = str(OUTDIR / "gwas" / "bodysize.assoc.txt"),
+        params:
+            pfx_in = PFX,
+            outdir = str(OUTDIR / "gwas"),
+        resources:
+            mem_mb = 32 * 1024,
+        conda: "envs/gemma.yaml"
+        shell:
+            """
+            # -n 1: use the phenotype file instead of .fam phenotype column
+            # GEMMA -lmm on continuous phenotype (body weight z-score)
+            gemma -bfile {params.pfx_in} -k {input.kin} \
+                  -p {input.pheno} \
+                  -lmm 4 -o bodysize -outdir {params.outdir}
+            """
 
 # ── Fst ───────────────────────────────────────────────────────────────────────
 rule fst_persnp:
@@ -278,7 +291,7 @@ rule plots:
         fst_snp      = str(OUTDIR / "fst" / "persnp.weir.fst"),
         fst_win      = str(OUTDIR / "fst" / "window.windowed.weir.fst"),
         pca_vec      = str(OUTDIR / "pca" / "pca.eigenvec"),
-        pheno        = PHENOTYPE,
+        pheno        = METADATA,
     output:
         mht_gwas     = str(OUTDIR / "plots" / "manhattan_gwas.pdf"),
         mht_fst      = str(OUTDIR / "plots" / "manhattan_fst.pdf"),

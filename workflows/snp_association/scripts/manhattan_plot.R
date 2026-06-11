@@ -6,7 +6,7 @@ suppressPackageStartupMessages({
     library(dplyr)
 })
 
-gwas_file   <- snakemake@input[["gwas"]]
+gwas_file   <- snakemake@input[["gwas_salt"]]
 fst_snp_file<- snakemake@input[["fst_snp"]]
 fst_win_file<- snakemake@input[["fst_win"]]
 pca_file    <- snakemake@input[["pca_vec"]]
