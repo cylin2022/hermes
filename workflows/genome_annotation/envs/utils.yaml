@@ -1,0 +1,7 @@
+name: utils
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - cd-hit=4.8.1

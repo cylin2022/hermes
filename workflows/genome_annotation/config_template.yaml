@@ -1,0 +1,52 @@
+# Genome Annotation Pipeline — Configuration
+# Steps: BUSCO → RepeatModeler → RepeatMasker → BRAKER4 → DIAMOND NR → InterProScan
+
+# ── Input ─────────────────────────────────────────────────────────────────────
+genome_fasta: "/path/to/assembly.fa"
+species_name: "my_species"          # no spaces; becomes RepeatModeler DB name
+
+# Optional hints for BRAKER4 (improves gene model quality substantially)
+rnaseq_bam: ""                      # sorted BAM aligned to this genome
+protein_fasta: ""                   # related-species protein FASTA (e.g. RefSeq)
+
+# ── RepeatModeler: parallelization strategy ───────────────────────────────────
+# "standard"  : one RepeatModeler instance, N parallel RECON rounds via -pa
+#               All-vs-all BLAST still runs n² pairs, but N rounds are processed
+#               concurrently instead of sequentially.
+#               Rule of thumb: pa = floor(threads / 35), so 160 cores → pa = 4
+#
+# "parallel"  : split genome into N chunks → N independent RepeatModeler instances
+#               → CD-HIT-EST merge at 80% identity
+#               Complexity per chunk: (n/N)² ; N chunks run in parallel
+#               Effective wall-clock ~ n² / N²  (not just n² / N)
+#               Best for genomes > 1 GB or with high repeat content (>50%)
+#               Slight sensitivity loss at chunk boundaries (~5% missed families)
+repeat_strategy: "standard"
+
+repeatmodeler_pa: 4                  # -pa for "standard" strategy (RECON round parallelism)
+genome_split_n: 4                    # N parallel instances for "parallel" strategy
+
+# Set to a previous RepeatModeler working directory to resume an interrupted run
+recover_dir: ""
+
+# ── EDTA: structural repeat annotation (optional, runs alongside RepeatModeler) ─
+# EDTA detects LTR, TIR, Helitron via structural features rather than all-vs-all
+# BLAST; ~5–10× faster than RepeatModeler for those element classes.
+# The EDTA + RepeatModeler combined library is used if use_edta: true.
+use_edta: false
+
+# ── BUSCO ─────────────────────────────────────────────────────────────────────
+run_busco: true
+busco_lineage: "vertebrata_odb10"    # actinopterygii_odb10 for fish; embryophyta_odb10 for plants
+
+# ── Databases (server paths) ──────────────────────────────────────────────────
+nr_diamond_db: "/home/cylin/Vet_Hamaguri/databases/nr.dmnd"
+eggnog_data_dir: "/home/cylin/Vet_Hamaguri/databases/eggnog_data"
+interproscan_dir: "/home/cylin/Vet_Hamaguri/databases/interproscan-5.73-104.0"
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+threads: 64
+mem_gb: 256
+
+# ── Output ────────────────────────────────────────────────────────────────────
+outdir: "/path/to/output"

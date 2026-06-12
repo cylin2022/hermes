@@ -1,0 +1,7 @@
+name: repeatmodeler
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - repeatmodeler=2.0.5
+  - repeatmasker=4.1.5

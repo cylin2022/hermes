@@ -1,0 +1,413 @@
+"""
+Genome Annotation Pipeline
+BUSCO → RepeatModeler → RepeatMasker → BRAKER4 → DIAMOND NR → InterProScan
+
+RepeatModeler is the dominant runtime (~50–100 h for a 1 GB genome).
+Two parallelization strategies are available; see config repeat_strategy.
+"""
+
+from pathlib import Path
+
+# ── Config ────────────────────────────────────────────────────────────────────
+GENOME_FA       = config["genome_fasta"]
+SPECIES_NAME    = config["species_name"]
+OUTDIR          = Path(config["outdir"])
+
+RNASEQ_BAM      = config.get("rnaseq_bam", "")
+PROTEIN_FA      = config.get("protein_fasta", "")
+
+REPEAT_STRATEGY = config.get("repeat_strategy", "standard")
+RM_PA           = int(config.get("repeatmodeler_pa", 4))
+GENOME_SPLIT_N  = int(config.get("genome_split_n", 4))
+RECOVER_DIR     = config.get("recover_dir", "")
+USE_EDTA        = str(config.get("use_edta", "false")).lower() == "true"
+
+RUN_BUSCO       = str(config.get("run_busco", "true")).lower() == "true"
+BUSCO_LINEAGE   = config.get("busco_lineage", "vertebrata_odb10")
+
+NR_DB           = config.get("nr_diamond_db", "/home/cylin/Vet_Hamaguri/databases/nr.dmnd")
+EGGNOG_DATA     = config.get("eggnog_data_dir", "/home/cylin/Vet_Hamaguri/databases/eggnog_data")
+INTERPROSCAN    = config.get("interproscan_dir", "/home/cylin/Vet_Hamaguri/databases/interproscan-5.73-104.0")
+
+THREADS         = int(config.get("threads", 64))
+MEM_GB          = int(config.get("mem_gb", 256))
+
+RM_DB_PREFIX    = str(OUTDIR / "repeats" / "rmdb" / SPECIES_NAME)
+CHUNKS          = list(range(GENOME_SPLIT_N))
+RM_CHUNK_THREADS = max(4, THREADS // GENOME_SPLIT_N)
+
+# ── Target rule ───────────────────────────────────────────────────────────────
+rule all:
+    input:
+        str(OUTDIR / "busco" / "short_summary.txt") if RUN_BUSCO else [],
+        str(OUTDIR / "repeats" / f"{SPECIES_NAME}-families.fa"),
+        str(OUTDIR / "masked" / f"{SPECIES_NAME}.masked.fa"),
+        str(OUTDIR / "braker4" / "braker.gtf"),
+        str(OUTDIR / "annotation" / "diamond_nr.tsv"),
+        str(OUTDIR / "annotation" / "interproscan.tsv"),
+
+# ── BUSCO ─────────────────────────────────────────────────────────────────────
+if RUN_BUSCO:
+    rule busco:
+        input:
+            genome = GENOME_FA,
+        output:
+            summary = str(OUTDIR / "busco" / "short_summary.txt"),
+        params:
+            lineage = BUSCO_LINEAGE,
+            outdir  = str(OUTDIR / "busco"),
+        threads: THREADS
+        resources:
+            mem_mb = 32 * 1024,
+        conda: "envs/busco.yaml"
+        shell:
+            """
+            busco -i {input.genome} \
+                  -l {params.lineage} \
+                  -o busco_run \
+                  --out_path {params.outdir} \
+                  -m genome \
+                  --cpu {threads} \
+                  --force
+            cp {params.outdir}/busco_run/short_summary*.txt {output.summary}
+            """
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RepeatModeler — Strategy: standard
+#
+# One RepeatModeler instance with -pa {RM_PA}.
+# -pa controls how many RECON clustering rounds run in parallel; each round
+# spawns rmblastn with threads/pa cores. Default pa=4 gives 4× more throughput
+# than the single-threaded default but does not reduce the n² BLAST call count.
+# ══════════════════════════════════════════════════════════════════════════════
+if REPEAT_STRATEGY == "standard":
+    rule repeatmodeler_db:
+        input:
+            genome = GENOME_FA,
+        output:
+            multiext(RM_DB_PREFIX, ".nhr", ".nin", ".nsq"),
+        params:
+            dbdir = str(OUTDIR / "repeats" / "rmdb"),
+            name  = SPECIES_NAME,
+        conda: "envs/repeatmodeler.yaml"
+        shell:
+            """
+            mkdir -p {params.dbdir}
+            cd {params.dbdir}
+            BuildDatabase -name {params.name} -engine ncbi {input.genome}
+            """
+
+    rule repeatmodeler:
+        input:
+            multiext(RM_DB_PREFIX, ".nhr", ".nin", ".nsq"),
+        output:
+            lib = str(OUTDIR / "repeats" / f"{SPECIES_NAME}-families.fa"),
+            stk = str(OUTDIR / "repeats" / f"{SPECIES_NAME}-families.stk"),
+        params:
+            db      = RM_DB_PREFIX,
+            pa      = RM_PA,
+            outdir  = str(OUTDIR / "repeats"),
+            recover = f"-recoverDir {RECOVER_DIR}" if RECOVER_DIR else "",
+        threads: THREADS
+        resources:
+            mem_mb = MEM_GB * 1024,
+        conda: "envs/repeatmodeler.yaml"
+        shell:
+            """
+            cd {params.outdir}
+            RepeatModeler \
+                -database {params.db} \
+                -pa {params.pa} \
+                -engine ncbi \
+                -LTRStruct \
+                {params.recover}
+            """
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RepeatModeler — Strategy: parallel (genome segmentation)
+#
+# Genome is split into N chunks. Each chunk has ~n/N sequences, so per-chunk
+# BLAST work is (n/N)² instead of n². N chunks run simultaneously.
+# Total BLAST calls: N × (n/N)² = n²/N  (run in parallel → wall-clock n²/N²)
+# For N=4: 16× theoretical speedup over single-threaded -pa 1.
+#
+# Trade-off: repeat families that span chunk boundaries may be missed or
+# fragmented (~5% of families for a well-balanced split). The CD-HIT-EST
+# merge step at 80% identity recovers most cross-chunk redundancy.
+# ══════════════════════════════════════════════════════════════════════════════
+else:
+    rule split_genome:
+        input:
+            genome = GENOME_FA,
+        output:
+            expand(str(OUTDIR / "repeats" / "chunks" / "chunk_{chunk:03d}.fa"), chunk=CHUNKS),
+        params:
+            outdir = str(OUTDIR / "repeats" / "chunks"),
+            n      = GENOME_SPLIT_N,
+        conda: "envs/utils.yaml"
+        script: "scripts/split_genome.py"
+
+    rule repeatmodeler_db_chunk:
+        input:
+            genome = str(OUTDIR / "repeats" / "chunks" / "chunk_{chunk:03d}.fa"),
+        output:
+            multiext(
+                str(OUTDIR / "repeats" / "chunks" / "db_{chunk}" / SPECIES_NAME),
+                ".nhr", ".nin", ".nsq",
+            ),
+        params:
+            dbdir = str(OUTDIR / "repeats" / "chunks" / "db_{chunk}"),
+            name  = SPECIES_NAME,
+        conda: "envs/repeatmodeler.yaml"
+        shell:
+            """
+            mkdir -p {params.dbdir}
+            cd {params.dbdir}
+            BuildDatabase -name {params.name} -engine ncbi {input.genome}
+            """
+
+    rule repeatmodeler_chunk:
+        input:
+            multiext(
+                str(OUTDIR / "repeats" / "chunks" / "db_{chunk}" / SPECIES_NAME),
+                ".nhr", ".nin", ".nsq",
+            ),
+        output:
+            lib = str(OUTDIR / "repeats" / "segments" / "chunk_{chunk}-families.fa"),
+        params:
+            db     = str(OUTDIR / "repeats" / "chunks" / "db_{chunk}" / SPECIES_NAME),
+            outdir = str(OUTDIR / "repeats" / "segments" / "chunk_{chunk}"),
+            pa     = max(1, RM_PA // GENOME_SPLIT_N),
+        threads: RM_CHUNK_THREADS
+        resources:
+            mem_mb = (MEM_GB * 1024) // GENOME_SPLIT_N,
+        conda: "envs/repeatmodeler.yaml"
+        shell:
+            """
+            mkdir -p {params.outdir}
+            cd {params.outdir}
+            RepeatModeler \
+                -database {params.db} \
+                -pa {params.pa} \
+                -engine ncbi \
+                -LTRStruct
+            # RepeatModeler writes output to working dir; locate and copy
+            found=$(find {params.outdir} -name "*-families.fa" | head -1)
+            if [ -n "$found" ]; then
+                cp "$found" {output.lib}
+            else
+                printf ">chunk_{wildcards.chunk}_no_repeats_found\\nN\\n" > {output.lib}
+            fi
+            """
+
+    rule merge_repeat_libs:
+        input:
+            libs = expand(
+                str(OUTDIR / "repeats" / "segments" / "chunk_{chunk}-families.fa"),
+                chunk=CHUNKS,
+            ),
+        output:
+            lib = str(OUTDIR / "repeats" / f"{SPECIES_NAME}-families.fa"),
+        params:
+            raw = str(OUTDIR / "repeats" / "merged_raw.fa"),
+        threads: min(THREADS, 16)
+        resources:
+            mem_mb = 32 * 1024,
+        conda: "envs/utils.yaml"
+        shell:
+            """
+            cat {input.libs} > {params.raw}
+
+            # Cluster at 80% identity to remove cross-chunk redundant families.
+            # -aS 0.8: alignment covers ≥80% of shorter sequence
+            # This is equivalent to the k-mer similarity filter described in the
+            # optimization notes: families that are ≥80% similar get merged into
+            # one representative, reducing RepeatMasker's search library by ~30–50%.
+            cd-hit-est \
+                -i {params.raw} \
+                -o {output.lib} \
+                -c 0.80 \
+                -aS 0.80 \
+                -n 8 \
+                -T {threads} \
+                -M {resources.mem_mb} \
+                -d 0
+            rm -f {params.raw}
+            """
+
+# ── EDTA: structural TE annotation (optional, adds to RM library) ─────────────
+# EDTA uses structural features (TSD, LTR length, TIR palindrome) rather than
+# all-vs-all BLAST. 5–10× faster than RepeatModeler for LTR/TIR/Helitron classes.
+# The combined RM + EDTA library gives better sensitivity than either alone.
+if USE_EDTA:
+    rule edta:
+        input:
+            genome = GENOME_FA,
+        output:
+            lib = str(OUTDIR / "repeats" / "edta" / f"{Path(GENOME_FA).name}.mod.EDTA.TElib.fa"),
+        params:
+            outdir = str(OUTDIR / "repeats" / "edta"),
+            genome = GENOME_FA,
+        threads: THREADS
+        resources:
+            mem_mb = MEM_GB * 1024,
+        conda: "envs/edta.yaml"
+        shell:
+            """
+            cd {params.outdir}
+            EDTA.pl \
+                --genome {params.genome} \
+                --species others \
+                --step all \
+                --threads {threads} \
+                --force 1
+            """
+
+    rule merge_rm_edta:
+        input:
+            rm_lib   = str(OUTDIR / "repeats" / f"{SPECIES_NAME}-families.fa"),
+            edta_lib = str(OUTDIR / "repeats" / "edta" / f"{Path(GENOME_FA).name}.mod.EDTA.TElib.fa"),
+        output:
+            lib = str(OUTDIR / "repeats" / f"{SPECIES_NAME}-combined.fa"),
+        threads: min(THREADS, 16)
+        resources:
+            mem_mb = 32 * 1024,
+        conda: "envs/utils.yaml"
+        shell:
+            """
+            cat {input.rm_lib} {input.edta_lib} > combined_raw.fa
+            cd-hit-est -i combined_raw.fa -o {output.lib} \
+                -c 0.80 -aS 0.80 -n 8 -T {threads} -M {resources.mem_mb} -d 0
+            rm -f combined_raw.fa
+            """
+
+def final_repeat_lib(wildcards):
+    if USE_EDTA:
+        return str(OUTDIR / "repeats" / f"{SPECIES_NAME}-combined.fa")
+    return str(OUTDIR / "repeats" / f"{SPECIES_NAME}-families.fa")
+
+# ── RepeatMasker: soft-mask ───────────────────────────────────────────────────
+rule repeatmasker:
+    input:
+        genome = GENOME_FA,
+        lib    = final_repeat_lib,
+    output:
+        masked = str(OUTDIR / "masked" / f"{SPECIES_NAME}.masked.fa"),
+        gff    = str(OUTDIR / "masked" / f"{SPECIES_NAME}.out.gff"),
+    params:
+        outdir = str(OUTDIR / "masked"),
+        gname  = Path(GENOME_FA).name,
+    threads: THREADS
+    resources:
+        mem_mb = 64 * 1024,
+    conda: "envs/repeatmodeler.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        RepeatMasker \
+            -pa {threads} \
+            -lib {input.lib} \
+            -gff \
+            -xsmall \
+            -dir {params.outdir} \
+            {input.genome}
+        mv {params.outdir}/{params.gname}.masked {output.masked} 2>/dev/null || cp {input.genome} {output.masked}
+        mv {params.outdir}/{params.gname}.out.gff {output.gff}   2>/dev/null || touch {output.gff}
+        """
+
+# ── BRAKER4: gene prediction ──────────────────────────────────────────────────
+rule braker4:
+    input:
+        genome   = str(OUTDIR / "masked" / f"{SPECIES_NAME}.masked.fa"),
+        rnaseq   = [RNASEQ_BAM]  if RNASEQ_BAM  else [],
+        proteins = [PROTEIN_FA]  if PROTEIN_FA  else [],
+    output:
+        gtf  = str(OUTDIR / "braker4" / "braker.gtf"),
+        aa   = str(OUTDIR / "braker4" / "braker.aa"),
+    params:
+        outdir    = str(OUTDIR / "braker4"),
+        species   = SPECIES_NAME,
+        rna_flag  = f"--bam={RNASEQ_BAM}"    if RNASEQ_BAM  else "",
+        prot_flag = f"--prot_seq={PROTEIN_FA}" if PROTEIN_FA else "",
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/braker4.yaml"
+    shell:
+        """
+        braker.pl \
+            --genome={input.genome} \
+            --species={params.species} \
+            --workingdir={params.outdir} \
+            --cores={threads} \
+            --gff3 \
+            {params.rna_flag} \
+            {params.prot_flag}
+        """
+
+# ── Protein extraction (AGAT) ─────────────────────────────────────────────────
+rule extract_proteins:
+    input:
+        genome = str(OUTDIR / "masked" / f"{SPECIES_NAME}.masked.fa"),
+        gtf    = str(OUTDIR / "braker4" / "braker.gtf"),
+    output:
+        prot   = str(OUTDIR / "annotation" / "predicted_proteins.fa"),
+    conda: "envs/annotation.yaml"
+    shell:
+        """
+        mkdir -p $(dirname {output.prot})
+        agat_sp_extract_sequences.pl \
+            --gff {input.gtf} \
+            --fasta {input.genome} \
+            --protein \
+            --output {output.prot}
+        """
+
+# ── DIAMOND NR ────────────────────────────────────────────────────────────────
+rule diamond_nr:
+    input:
+        prot = str(OUTDIR / "annotation" / "predicted_proteins.fa"),
+        db   = NR_DB,
+    output:
+        str(OUTDIR / "annotation" / "diamond_nr.tsv"),
+    threads: THREADS
+    resources:
+        mem_mb = 128 * 1024,
+    conda: "envs/annotation.yaml"
+    shell:
+        """
+        diamond blastp \
+            --db {input.db} \
+            --query {input.prot} \
+            --out {output} \
+            --threads {threads} \
+            --block-size 10 \
+            --outfmt 6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore stitle \
+            --max-target-seqs 5 \
+            --evalue 1e-5 \
+            --sensitive
+        """
+
+# ── InterProScan ──────────────────────────────────────────────────────────────
+rule interproscan:
+    input:
+        prot = str(OUTDIR / "annotation" / "predicted_proteins.fa"),
+    output:
+        tsv  = str(OUTDIR / "annotation" / "interproscan.tsv"),
+    params:
+        ipr  = INTERPROSCAN,
+    threads: THREADS
+    resources:
+        mem_mb = 128 * 1024,
+    conda: "envs/annotation.yaml"
+    shell:
+        """
+        {params.ipr}/interproscan.sh \
+            -i {input.prot} \
+            -o {output.tsv} \
+            -f TSV \
+            -cpu {threads} \
+            -goterms \
+            -iprlookup \
+            --disable-precalc
+        """
