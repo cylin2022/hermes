@@ -1,0 +1,232 @@
+"""
+RNA-seq differential expression pipeline
+FastQC → fastp → STAR 2-pass → featureCounts → DESeq2 + clusterProfiler
+"""
+
+from pathlib import Path
+import csv
+
+# ── Config ────────────────────────────────────────────────────────────────────
+SAMPLESHEET = config["samplesheet"]
+OUTDIR      = Path(config["outdir"])
+GENOME_FA   = config["genome_fasta"]
+GTF         = config["gtf"]
+COMPARISONS = config.get("comparisons", [])
+PADJ_THRESH = float(config.get("padj_threshold", 0.05))
+LFC_THRESH  = float(config.get("log2fc_threshold", 1.0))
+SPECIES     = config.get("species", "Mus_musculus")
+THREADS     = int(config.get("threads", 64))
+MEM_GB      = int(config.get("mem_gb", 128))
+
+def _read_samplesheet(path):
+    ss = {}
+    with open(path) as fh:
+        for row in csv.DictReader(fh):
+            sid = row["sample"].strip()
+            ss[sid] = {"group": row["group"].strip(),
+                       "r1":    row["r1"].strip(),
+                       "r2":    row["r2"].strip()}
+    if not ss:
+        raise ValueError(f"Samplesheet '{path}' has no valid rows")
+    return ss
+
+_SS        = _read_samplesheet(SAMPLESHEET)
+SAMPLES    = list(_SS.keys())
+STAR_INDEX = str(OUTDIR / "star_index")
+CONTRASTS  = [f"{c[0]}_vs_{c[1]}" for c in COMPARISONS]
+
+# ── Target rule ───────────────────────────────────────────────────────────────
+rule all:
+    input:
+        str(OUTDIR / "multiqc" / "multiqc_report.html"),
+        str(OUTDIR / "counts" / "counts_matrix.tsv"),
+        expand(str(OUTDIR / "deseq2" / "{contrast}_results.tsv"), contrast=CONTRASTS),
+
+# ── QC ────────────────────────────────────────────────────────────────────────
+rule fastqc:
+    input:
+        r1 = lambda wc: _SS[wc.sample]["r1"],
+        r2 = lambda wc: _SS[wc.sample]["r2"],
+    output:
+        z1 = str(OUTDIR / "fastqc" / "{sample}_R1_fastqc.zip"),
+        z2 = str(OUTDIR / "fastqc" / "{sample}_R2_fastqc.zip"),
+    params:
+        outdir = str(OUTDIR / "fastqc"),
+    threads: 4
+    resources:
+        mem_mb = 4 * 1024,
+    conda: "envs/qc.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        fastqc -t {threads} -o {params.outdir} {input.r1} {input.r2}
+        """
+
+rule fastp:
+    input:
+        r1 = lambda wc: _SS[wc.sample]["r1"],
+        r2 = lambda wc: _SS[wc.sample]["r2"],
+    output:
+        r1   = str(OUTDIR / "trimmed" / "{sample}_R1.fastq.gz"),
+        r2   = str(OUTDIR / "trimmed" / "{sample}_R2.fastq.gz"),
+        html = str(OUTDIR / "fastp"   / "{sample}.html"),
+        json = str(OUTDIR / "fastp"   / "{sample}.json"),
+    threads: 16
+    resources:
+        mem_mb = 8 * 1024,
+    conda: "envs/qc.yaml"
+    shell:
+        """
+        fastp -i {input.r1} -I {input.r2} \
+              -o {output.r1} -O {output.r2} \
+              -h {output.html} -j {output.json} \
+              --thread {threads} \
+              --detect_adapter_for_pe \
+              --correction \
+              --qualified_quality_phred 20 \
+              --length_required 25
+        """
+
+# ── STAR index ────────────────────────────────────────────────────────────────
+rule star_index:
+    input:
+        genome = GENOME_FA,
+        gtf    = GTF,
+    output:
+        directory(STAR_INDEX),
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/star.yaml"
+    shell:
+        """
+        mkdir -p {output}
+        STAR --runMode genomeGenerate \
+             --genomeDir {output} \
+             --genomeFastaFiles {input.genome} \
+             --sjdbGTFfile {input.gtf} \
+             --runThreadN {threads}
+        """
+
+# ── STAR 2-pass ───────────────────────────────────────────────────────────────
+# Pass 1: discover novel splice junctions without writing BAM (faster)
+rule star_pass1:
+    input:
+        r1    = str(OUTDIR / "trimmed" / "{sample}_R1.fastq.gz"),
+        r2    = str(OUTDIR / "trimmed" / "{sample}_R2.fastq.gz"),
+        index = STAR_INDEX,
+    output:
+        sj = str(OUTDIR / "star_pass1" / "{sample}" / "SJ.out.tab"),
+    params:
+        pfx = str(OUTDIR / "star_pass1" / "{sample}") + "/",
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/star.yaml"
+    shell:
+        """
+        STAR --runMode alignReads \
+             --genomeDir {input.index} \
+             --readFilesIn {input.r1} {input.r2} \
+             --readFilesCommand zcat \
+             --outSAMtype None \
+             --outSJtype Standard \
+             --runThreadN {threads} \
+             --outFileNamePrefix {params.pfx}
+        """
+
+# Pass 2: align with pooled junctions from all samples for consistent splice site calling
+rule star_pass2:
+    input:
+        r1    = str(OUTDIR / "trimmed" / "{sample}_R1.fastq.gz"),
+        r2    = str(OUTDIR / "trimmed" / "{sample}_R2.fastq.gz"),
+        index = STAR_INDEX,
+        sjs   = expand(str(OUTDIR / "star_pass1" / "{s}" / "SJ.out.tab"), s=SAMPLES),
+    output:
+        bam = temp(str(OUTDIR / "star" / "{sample}" / "Aligned.sortedByCoord.out.bam")),
+        log = str(OUTDIR / "star" / "{sample}" / "Log.final.out"),
+    params:
+        pfx    = str(OUTDIR / "star" / "{sample}") + "/",
+        sj_str = lambda wc, input: " ".join(input.sjs),
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/star.yaml"
+    shell:
+        """
+        STAR --runMode alignReads \
+             --genomeDir {input.index} \
+             --readFilesIn {input.r1} {input.r2} \
+             --readFilesCommand zcat \
+             --outSAMtype BAM SortedByCoordinate \
+             --outSAMattributes NH HI AS NM \
+             --outBAMsortingBinsN 100 \
+             --outBAMsortingThreadN {threads} \
+             --sjdbFileChrStartEnd {params.sj_str} \
+             --runThreadN {threads} \
+             --outFileNamePrefix {params.pfx}
+        samtools index -@ {threads} {output.bam}
+        """
+
+# ── featureCounts ─────────────────────────────────────────────────────────────
+rule featurecounts:
+    input:
+        bams = expand(str(OUTDIR / "star" / "{sample}" / "Aligned.sortedByCoord.out.bam"),
+                      sample=SAMPLES),
+        gtf  = GTF,
+    output:
+        counts  = str(OUTDIR / "counts" / "counts_matrix.tsv"),
+        summary = str(OUTDIR / "counts" / "counts_matrix.tsv.summary"),
+    params:
+        outdir = str(OUTDIR / "counts"),
+    threads: THREADS
+    resources:
+        mem_mb = 16 * 1024,
+    conda: "envs/subread.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        featureCounts \
+            -a {input.gtf} \
+            -o {output.counts} \
+            -p -B -C \
+            -T {threads} \
+            {input.bams}
+        """
+
+# ── MultiQC ───────────────────────────────────────────────────────────────────
+rule multiqc:
+    input:
+        expand(str(OUTDIR / "fastqc"  / "{sample}_R1_fastqc.zip"),      sample=SAMPLES),
+        expand(str(OUTDIR / "fastp"   / "{sample}.json"),                sample=SAMPLES),
+        expand(str(OUTDIR / "star"    / "{sample}" / "Log.final.out"),   sample=SAMPLES),
+        str(OUTDIR / "counts" / "counts_matrix.tsv.summary"),
+    output:
+        str(OUTDIR / "multiqc" / "multiqc_report.html"),
+    conda: "envs/qc.yaml"
+    shell:
+        "multiqc {OUTDIR}/fastqc/ {OUTDIR}/fastp/ {OUTDIR}/star/ {OUTDIR}/counts/ "
+        "-o {OUTDIR}/multiqc/ --force"
+
+# ── DESeq2 + clusterProfiler ──────────────────────────────────────────────────
+rule deseq2:
+    input:
+        counts   = str(OUTDIR / "counts" / "counts_matrix.tsv"),
+        metadata = SAMPLESHEET,
+    output:
+        results = str(OUTDIR / "deseq2" / "{contrast}_results.tsv"),
+        rlog    = str(OUTDIR / "deseq2" / "{contrast}_rlog.rds"),
+        volcano = str(OUTDIR / "deseq2" / "{contrast}_volcano.pdf"),
+        enrich  = str(OUTDIR / "deseq2" / "{contrast}_enrichment.tsv"),
+    params:
+        contrast    = "{contrast}",
+        comparisons = COMPARISONS,
+        padj        = PADJ_THRESH,
+        lfc         = LFC_THRESH,
+        species     = SPECIES,
+        outdir      = str(OUTDIR / "deseq2"),
+    threads: 8
+    resources:
+        mem_mb = 32 * 1024,
+    conda: "envs/r_deseq2.yaml"
+    script: "scripts/deseq2_clusterProfiler.R"

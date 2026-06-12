@@ -1,0 +1,243 @@
+"""
+ATAC-seq pipeline: open chromatin peak calling + differential accessibility
+FastQC → fastp → Bowtie2 → samtools markdup → MACS3 → DiffBind
+"""
+
+from pathlib import Path
+import csv
+
+# ── Config ────────────────────────────────────────────────────────────────────
+SAMPLESHEET  = config["samplesheet"]
+OUTDIR       = Path(config["outdir"])
+GENOME_FA    = config["genome_fasta"]
+GENOME_SIZE  = config.get("genome_size", "2.7e9")
+BLACKLIST    = config.get("blacklist", "")
+COMPARISONS  = config.get("comparisons", [])
+PADJ_THRESH  = float(config.get("padj_threshold", 0.05))
+LFC_THRESH   = float(config.get("log2fc_threshold", 1.0))
+THREADS      = int(config.get("threads", 64))
+MEM_GB       = int(config.get("mem_gb", 128))
+
+def _read_samplesheet(path):
+    ss = {}
+    with open(path) as fh:
+        for row in csv.DictReader(fh):
+            sid = row["sample"].strip()
+            ss[sid] = {"group": row["group"].strip(),
+                       "r1":    row["r1"].strip(),
+                       "r2":    row["r2"].strip()}
+    if not ss:
+        raise ValueError(f"Samplesheet '{path}' has no valid rows")
+    return ss
+
+_SS      = _read_samplesheet(SAMPLESHEET)
+SAMPLES  = list(_SS.keys())
+CONTRASTS = [f"{c[0]}_vs_{c[1]}" for c in COMPARISONS]
+BT2_INDEX = str(OUTDIR / "bowtie2_index" / "genome")
+
+# ── Target rule ───────────────────────────────────────────────────────────────
+rule all:
+    input:
+        str(OUTDIR / "multiqc" / "multiqc_report.html"),
+        expand(str(OUTDIR / "peaks" / "{sample}_peaks.narrowPeak"), sample=SAMPLES),
+        expand(str(OUTDIR / "diffbind" / "{contrast}_results.tsv"), contrast=CONTRASTS),
+
+# ── QC ────────────────────────────────────────────────────────────────────────
+rule fastqc:
+    input:
+        r1 = lambda wc: _SS[wc.sample]["r1"],
+        r2 = lambda wc: _SS[wc.sample]["r2"],
+    output:
+        z1 = str(OUTDIR / "fastqc" / "{sample}_R1_fastqc.zip"),
+        z2 = str(OUTDIR / "fastqc" / "{sample}_R2_fastqc.zip"),
+    params:
+        outdir = str(OUTDIR / "fastqc"),
+    threads: 4
+    resources:
+        mem_mb = 4 * 1024,
+    conda: "envs/qc.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        fastqc -t {threads} -o {params.outdir} {input.r1} {input.r2}
+        """
+
+rule fastp:
+    input:
+        r1 = lambda wc: _SS[wc.sample]["r1"],
+        r2 = lambda wc: _SS[wc.sample]["r2"],
+    output:
+        r1   = str(OUTDIR / "trimmed" / "{sample}_R1.fastq.gz"),
+        r2   = str(OUTDIR / "trimmed" / "{sample}_R2.fastq.gz"),
+        html = str(OUTDIR / "fastp"   / "{sample}.html"),
+        json = str(OUTDIR / "fastp"   / "{sample}.json"),
+    threads: 16
+    resources:
+        mem_mb = 8 * 1024,
+    conda: "envs/qc.yaml"
+    shell:
+        """
+        fastp -i {input.r1} -I {input.r2} \
+              -o {output.r1} -O {output.r2} \
+              -h {output.html} -j {output.json} \
+              --thread {threads} \
+              --detect_adapter_for_pe \
+              --qualified_quality_phred 20 \
+              --length_required 25
+        """
+
+# ── Bowtie2 index ─────────────────────────────────────────────────────────────
+rule bowtie2_index:
+    input:
+        genome = GENOME_FA,
+    output:
+        multiext(BT2_INDEX, ".1.bt2", ".2.bt2", ".3.bt2", ".4.bt2", ".rev.1.bt2", ".rev.2.bt2"),
+    params:
+        prefix = BT2_INDEX,
+    threads: THREADS
+    resources:
+        mem_mb = 32 * 1024,
+    conda: "envs/align.yaml"
+    shell:
+        """
+        mkdir -p $(dirname {params.prefix})
+        bowtie2-build --threads {threads} {input.genome} {params.prefix}
+        """
+
+# ── Align ─────────────────────────────────────────────────────────────────────
+rule bowtie2:
+    input:
+        r1  = str(OUTDIR / "trimmed" / "{sample}_R1.fastq.gz"),
+        r2  = str(OUTDIR / "trimmed" / "{sample}_R2.fastq.gz"),
+        idx = multiext(BT2_INDEX, ".1.bt2", ".2.bt2", ".3.bt2", ".4.bt2", ".rev.1.bt2", ".rev.2.bt2"),
+    output:
+        bam = temp(str(OUTDIR / "aligned" / "{sample}.raw.bam")),
+    params:
+        index = BT2_INDEX,
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/align.yaml"
+    shell:
+        """
+        mkdir -p $(dirname {output.bam})
+        bowtie2 -x {params.index} \
+                -1 {input.r1} -2 {input.r2} \
+                --no-mixed --no-discordant \
+                -X 2000 \
+                --threads {threads} | \
+        samtools view -bS -q 10 -F 1804 - | \
+        samtools sort -@ {threads} -m 2G -o {output.bam}
+        """
+
+# ── Mark duplicates ───────────────────────────────────────────────────────────
+rule markdup:
+    input:
+        bam = str(OUTDIR / "aligned" / "{sample}.raw.bam"),
+    output:
+        bam  = str(OUTDIR / "aligned" / "{sample}.markdup.bam"),
+        bai  = str(OUTDIR / "aligned" / "{sample}.markdup.bam.bai"),
+        stat = str(OUTDIR / "aligned" / "{sample}.markdup.flagstat"),
+    threads: 8
+    resources:
+        mem_mb = 32 * 1024,
+    conda: "envs/align.yaml"
+    shell:
+        """
+        samtools markdup -@ {threads} --write-index {input.bam} {output.bam}
+        samtools flagstat -@ {threads} {output.bam} > {output.stat}
+        """
+
+# ── Optional: remove blacklist regions ───────────────────────────────────────
+if BLACKLIST:
+    rule blacklist_filter:
+        input:
+            bam  = str(OUTDIR / "aligned" / "{sample}.markdup.bam"),
+            bai  = str(OUTDIR / "aligned" / "{sample}.markdup.bam.bai"),
+            bl   = BLACKLIST,
+        output:
+            bam  = str(OUTDIR / "aligned" / "{sample}.filtered.bam"),
+            bai  = str(OUTDIR / "aligned" / "{sample}.filtered.bam.bai"),
+        threads: 8
+        conda: "envs/align.yaml"
+        shell:
+            """
+            bedtools intersect -v -abam {input.bam} -b {input.bl} > {output.bam}
+            samtools index -@ {threads} {output.bam}
+            """
+
+def final_bam(wc):
+    if BLACKLIST:
+        return str(OUTDIR / "aligned" / f"{wc.sample}.filtered.bam")
+    return str(OUTDIR / "aligned" / f"{wc.sample}.markdup.bam")
+
+# ── MACS3 peak calling ────────────────────────────────────────────────────────
+# --nomodel --nolambda: ATAC signal is not ChIP-like; skip local lambda model
+# --shift -75 --extsize 150: centre reads on Tn5 cut sites (nucleosome-free regions)
+rule macs3:
+    input:
+        bam = final_bam,
+    output:
+        peak    = str(OUTDIR / "peaks" / "{sample}_peaks.narrowPeak"),
+        summit  = str(OUTDIR / "peaks" / "{sample}_summits.bed"),
+        xls     = str(OUTDIR / "peaks" / "{sample}_peaks.xls"),
+    params:
+        name   = "{sample}",
+        outdir = str(OUTDIR / "peaks"),
+        gsize  = GENOME_SIZE,
+    threads: 1
+    resources:
+        mem_mb = 8 * 1024,
+    conda: "envs/macs3.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        macs3 callpeak \
+            -t {input.bam} \
+            -f BAMPE \
+            -n {params.name} \
+            --outdir {params.outdir} \
+            -g {params.gsize} \
+            --nomodel --nolambda \
+            --shift -75 --extsize 150 \
+            --keep-dup all \
+            -q 0.01
+        """
+
+# ── MultiQC ───────────────────────────────────────────────────────────────────
+rule multiqc:
+    input:
+        expand(str(OUTDIR / "fastqc"  / "{sample}_R1_fastqc.zip"),    sample=SAMPLES),
+        expand(str(OUTDIR / "fastp"   / "{sample}.json"),              sample=SAMPLES),
+        expand(str(OUTDIR / "aligned" / "{sample}.markdup.flagstat"),  sample=SAMPLES),
+    output:
+        str(OUTDIR / "multiqc" / "multiqc_report.html"),
+    conda: "envs/qc.yaml"
+    shell:
+        "multiqc {OUTDIR}/fastqc/ {OUTDIR}/fastp/ {OUTDIR}/aligned/ "
+        "-o {OUTDIR}/multiqc/ --force"
+
+# ── DiffBind: differential accessibility ─────────────────────────────────────
+rule diffbind:
+    input:
+        bams     = expand(str(OUTDIR / "aligned" / "{sample}.markdup.bam"),   sample=SAMPLES),
+        bais     = expand(str(OUTDIR / "aligned" / "{sample}.markdup.bam.bai"), sample=SAMPLES),
+        peaks    = expand(str(OUTDIR / "peaks"   / "{sample}_peaks.narrowPeak"), sample=SAMPLES),
+        metadata = SAMPLESHEET,
+    output:
+        results  = str(OUTDIR / "diffbind" / "{contrast}_results.tsv"),
+        volcano  = str(OUTDIR / "diffbind" / "{contrast}_volcano.pdf"),
+        pca_plot = str(OUTDIR / "diffbind" / "pca.pdf"),
+    params:
+        contrast    = "{contrast}",
+        comparisons = COMPARISONS,
+        padj        = PADJ_THRESH,
+        lfc         = LFC_THRESH,
+        outdir      = str(OUTDIR / "diffbind"),
+        bam_dir     = str(OUTDIR / "aligned"),
+        peak_dir    = str(OUTDIR / "peaks"),
+    threads: THREADS
+    resources:
+        mem_mb = 64 * 1024,
+    conda: "envs/r_diffbind.yaml"
+    script: "scripts/diffbind.R"

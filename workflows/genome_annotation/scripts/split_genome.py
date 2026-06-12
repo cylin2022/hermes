@@ -47,7 +47,7 @@ seqs  = read_fasta(genome_fa)
 bins  = greedy_split(seqs, n_chunks)
 
 for i, chunk in enumerate(bins):
-    outpath = outdir / f"chunk_{i:03d}.fa"
+    outpath = outdir / f"chunk_{i:03d}.fa"  # matches CHUNKS = [f"{i:03d}" for i in range(N)]
     with open(outpath, "w") as fh:
         if not chunk:
             fh.write(f">chunk_{i}_placeholder\nN\n")

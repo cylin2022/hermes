@@ -1,0 +1,9 @@
+name: atacseq_r
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base=4.3
+  - bioconductor-diffbind=3.12
+  - bioconductor-biocparallel=1.36
+  - r-ggplot2=3.5

@@ -1,20 +1,18 @@
-# RNA-seq Differential Expression Pipeline — Configuration Template
-# Steps: FastQC → fastp → STAR 2-pass → featureCounts → DESeq2 → clusterProfiler
+# ATAC-seq Peak Calling & Differential Accessibility — Configuration Template
+# Steps: FastQC → fastp → Bowtie2 → markdup → MACS3 → DiffBind → IDR
 
 # ── Input ─────────────────────────────────────────────────────────────────────
 # CSV with header: sample,group,r1,r2
+# group = condition label used in DiffBind contrasts
 samplesheet: "/path/to/samplesheet.csv"
 
 # ── Reference ─────────────────────────────────────────────────────────────────
 genome_fasta: "/path/to/genome.fa"
-gtf: "/path/to/annotation.gtf"
+genome_size: "2.7e9"             # Effective genome size for MACS3 (hs=2.7e9, mm=1.87e9, custom=genome_fa size)
+blacklist: ""                    # BED file of ENCODE/custom blacklist regions (leave empty to skip)
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
-species: "Mus_musculus"          # Used for KEGG enrichment organism code
-                                  # Supported: Mus_musculus, Homo_sapiens, Danio_rerio,
-                                  #            Oreochromis_niloticus, Gallus_gallus, Rattus_norvegicus
-
-comparisons:                     # DESeq2 contrasts: [numerator, denominator]
+comparisons:                     # DiffBind contrasts: [numerator, denominator]
   - ["treatment", "control"]
 
 padj_threshold: 0.05
@@ -22,7 +20,7 @@ log2fc_threshold: 1.0
 
 # ── Resources ─────────────────────────────────────────────────────────────────
 threads: 64
-mem_gb: 128                      # STAR genome load: ~33 GB for mammalian; 128 GB is safe headroom
+mem_gb: 128
 
 # ── Output ────────────────────────────────────────────────────────────────────
 outdir: "/path/to/output"

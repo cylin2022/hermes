@@ -1,0 +1,11 @@
+name: rnaseq_r
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base=4.3
+  - bioconductor-deseq2=1.42
+  - bioconductor-biocparallel=1.36
+  - r-ggplot2=3.5
+  - bioconductor-clusterprofiler=4.10
+  - r-data.table=1.15

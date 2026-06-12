@@ -33,7 +33,7 @@ THREADS         = int(config.get("threads", 64))
 MEM_GB          = int(config.get("mem_gb", 256))
 
 RM_DB_PREFIX    = str(OUTDIR / "repeats" / "rmdb" / SPECIES_NAME)
-CHUNKS          = list(range(GENOME_SPLIT_N))
+CHUNKS          = [f"{i:03d}" for i in range(GENOME_SPLIT_N)]
 RM_CHUNK_THREADS = max(4, THREADS // GENOME_SPLIT_N)
 
 # ── Target rule ───────────────────────────────────────────────────────────────
@@ -140,7 +140,7 @@ else:
         input:
             genome = GENOME_FA,
         output:
-            expand(str(OUTDIR / "repeats" / "chunks" / "chunk_{chunk:03d}.fa"), chunk=CHUNKS),
+            expand(str(OUTDIR / "repeats" / "chunks" / "chunk_{chunk}.fa"), chunk=CHUNKS),
         params:
             outdir = str(OUTDIR / "repeats" / "chunks"),
             n      = GENOME_SPLIT_N,
@@ -149,7 +149,7 @@ else:
 
     rule repeatmodeler_db_chunk:
         input:
-            genome = str(OUTDIR / "repeats" / "chunks" / "chunk_{chunk:03d}.fa"),
+            genome = str(OUTDIR / "repeats" / "chunks" / "chunk_{chunk}.fa"),
         output:
             multiext(
                 str(OUTDIR / "repeats" / "chunks" / "db_{chunk}" / SPECIES_NAME),

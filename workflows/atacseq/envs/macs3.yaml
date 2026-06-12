@@ -1,0 +1,6 @@
+name: atacseq_macs3
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - macs3=3.0.1
