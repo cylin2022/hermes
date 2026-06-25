@@ -106,7 +106,7 @@ message("[plots] Reading per-SNP Fst: ", fst_snp_file)
 fst <- fread(fst_snp_file)
 # VCFtools output: CHROM POS WEIR_AND_COCKERHAM_FST
 setnames(fst, c("CHROM", "POS", "FST"))
-fst <- fst[!is.na(FST) & FST >= 0]
+fst <- fst[!is.na(FST) & FST > 0]  # CMplot requires > 0 when LOG10=TRUE
 
 fst_threshold <- quantile(fst$FST, fst_top_pct / 100, na.rm = TRUE)
 message(sprintf("[plots] Fst top %g%% threshold = %.4f", 100 - fst_top_pct, fst_threshold))
@@ -125,6 +125,7 @@ CMplot(
     fst_plt,
     type            = "p",
     plot.type       = "m",
+    LOG10           = FALSE,   # Fst is already on 0-1 scale; no log transform
     threshold       = fst_threshold,
     threshold.lwd   = 1,
     threshold.lty   = 1,
