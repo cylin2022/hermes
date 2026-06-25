@@ -23,6 +23,17 @@ fst_top_pct <- as.numeric(snakemake@params[["fst_top"]])
 outdir      <- snakemake@params[["outdir"]]
 dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
+# ── 0. Chromosome name mapping (NCBI accession → integer) ────────────────────
+# Non-model organisms use NCBI accession IDs (NC_031965.2, etc.).
+# CMplot requires integer chromosome numbers; we sort NC_ accessions
+# lexicographically and assign 1..N. Unplaced scaffolds (NW_, MT) are dropped.
+make_chr_map <- function(chr_vec) {
+    nc <- sort(unique(grep("^NC_", chr_vec, value = TRUE)))
+    if (length(nc) == 0) return(NULL)
+    map <- data.table(orig = nc, Chr = seq_along(nc))
+    map
+}
+
 # ── 1. GWAS Manhattan + QQ ────────────────────────────────────────────────────
 message("[plots] Reading GEMMA output: ", gwas_file)
 gwas <- fread(gwas_file)
@@ -30,7 +41,13 @@ gwas <- fread(gwas_file)
 # GEMMA .assoc.txt columns: chr rs ps n_miss allele1 allele0 af beta se logl_H1 l_remle p_wald p_lrt p_score
 # CMplot expects: SNP, Chr, Pos, P
 # Use p_lrt as primary (most powerful of the three GEMMA tests)
-gwas_plt <- gwas[, .(SNP = rs, Chr = chr, Pos = ps, P = p_lrt)]
+chr_map <- make_chr_map(gwas$chr)
+if (!is.null(chr_map)) {
+    gwas <- merge(gwas, chr_map, by.x = "chr", by.y = "orig", all.x = FALSE)
+    gwas_plt <- gwas[, .(SNP = rs, Chr = Chr, Pos = ps, P = p_lrt)]
+} else {
+    gwas_plt <- gwas[, .(SNP = rs, Chr = chr, Pos = ps, P = p_lrt)]
+}
 gwas_plt <- gwas_plt[!is.na(P) & P > 0]
 
 # Genomic inflation factor λ
@@ -92,7 +109,13 @@ fst_threshold <- quantile(fst$FST, fst_top_pct / 100, na.rm = TRUE)
 message(sprintf("[plots] Fst top %g%% threshold = %.4f", 100 - fst_top_pct, fst_threshold))
 writeLines(sprintf("fst_outlier_threshold = %.4f", fst_threshold), file.path(outdir, "fst_threshold.txt"))
 
-fst_plt <- fst[, .(SNP = paste0(CHROM, ":", POS), Chr = CHROM, Pos = POS, FST = FST)]
+fst_chr_map <- make_chr_map(fst$CHROM)
+if (!is.null(fst_chr_map)) {
+    fst <- merge(fst, fst_chr_map, by.x = "CHROM", by.y = "orig", all.x = FALSE)
+    fst_plt <- fst[, .(SNP = paste0(CHROM, ":", POS), Chr = Chr, Pos = POS, FST = FST)]
+} else {
+    fst_plt <- fst[, .(SNP = paste0(CHROM, ":", POS), Chr = CHROM, Pos = POS, FST = FST)]
+}
 
 pdf(mht_fst, width = 14, height = 5)
 CMplot(
