@@ -131,6 +131,7 @@ rule vcf_to_plink:
             --mind {params.mind} \
             --hwe {params.hwe} \
             --vcf-half-call missing \
+            --double-id \
             --allow-extra-chr \
             --set-all-var-ids '@:#:$r:$a' \
             --new-id-max-allele-len 100 missing
