@@ -79,13 +79,36 @@ Databases       : /home/cylin/Vet_Hamaguri/databases/
 **NEVER run `run_workflow` without explicit user approval.**
 **ALWAYS use `dry_run=True` to preview before the real run when uncertain.**
 
+## Workflow Critique (automated code review)
+
+Before committing any new or modified workflow, run an independent critique:
+
+```
+# Review one workflow
+Workflow({ scriptPath: "/home/cylin/hermes/.claude/workflows/critique.js", args: ["pool_seq"] })
+
+# Review multiple workflows
+Workflow({ scriptPath: "/home/cylin/hermes/.claude/workflows/critique.js", args: ["pool_seq", "snp_association"] })
+
+# Review ALL workflows
+Workflow({ scriptPath: "/home/cylin/hermes/.claude/workflows/critique.js" })
+```
+
+Each call spawns **independent agents** (no shared context) that check the Snakefile, scripts, and conda envs against PIPELINE_CHECKLIST.md. Results include a verdict per workflow (`ready_to_run` / `minor_fixes_needed` / `critical_fixes_required`) and a prioritized fix list. Typical runtime: 2–4 minutes per workflow.
+
+**When to run:**
+- After writing a new workflow (before first pilot run)
+- After modifying ≥1 shell block or script
+- After adding a new tool or changing a conda env
+
 ## Workflow Development Checklist
 
 When helping develop or modify a new workflow rule, reference `/home/cylin/hermes/PIPELINE_CHECKLIST.md` and walk through its gates before recommending a full run:
 
-1. **Docker gate** — every `docker run` must have `--user $(id -u):$(id -g)`
-2. **Tool behavior gate** — manually test each new tool on a single small chromosome before integrating
-3. **Rule design gate** — `set -euo pipefail` + `test -s` output validation in every shell block
-4. **Config sync gate** — version numbers match in Snakefile, config_template.yaml, and INSTALL.md
-5. **Pilot test gate** — 2 samples × 3 smallest scaffolds before full run
-6. **Monitor gate** — PID file live, notify watchers running, test notification received
+1. **Critique gate** — run `Workflow({scriptPath: "/home/cylin/hermes/.claude/workflows/critique.js", args: ["<name>"]})` first; resolve all `critical_fixes_required` before proceeding
+2. **Docker gate** — every `docker run` must have `--user $(id -u):$(id -g)`
+3. **Tool behavior gate** — manually test each new tool on a single small chromosome before integrating
+4. **Rule design gate** — `set -euo pipefail` + `test -s` output validation in every shell block
+5. **Config sync gate** — version numbers match in Snakefile, config_template.yaml, and INSTALL.md
+6. **Pilot test gate** — 2 samples × 3 smallest scaffolds before full run
+7. **Monitor gate** — PID file live, notify watchers running, test notification received
