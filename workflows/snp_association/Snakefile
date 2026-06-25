@@ -129,7 +129,7 @@ rule vcf_to_plink:
             --maf {params.maf} \
             --geno {params.geno} \
             --mind {params.mind} \
-            --hwe {params.hwe} keep-controls \
+            --hwe {params.hwe} \
             --allow-extra-chr \
             --set-all-var-ids '@:#:$r:$a' \
             --new-id-max-allele-len 100 missing
