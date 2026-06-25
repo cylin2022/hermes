@@ -56,8 +56,10 @@ lambda <- round(median(chi2, na.rm = TRUE) / qchisq(0.5, 1), 3)
 message(sprintf("[plots] Genomic inflation factor λ = %.3f", lambda))
 writeLines(sprintf("lambda = %.3f", lambda), file.path(outdir, "lambda.txt"))
 
-# Manhattan plot
+# Manhattan plot — CMplot always writes to cwd; setwd to outdir first
 message("[plots] Drawing GWAS Manhattan plot")
+old_wd <- getwd()
+setwd(outdir)
 CMplot(
     gwas_plt,
     type            = "p",
@@ -71,32 +73,33 @@ CMplot(
     signal.pch      = 19,
     signal.col      = "red",
     file            = "pdf",
-    file.name       = "manhattan_gwas",
+    file.name       = "gwas_salt",
     dpi             = 300,
     file.output     = TRUE,
-    output.file.name= file.path(outdir, "manhattan_gwas"),
     verbose         = FALSE
 )
-# CMplot writes to working dir; move if needed
-if (!file.exists(mht_gwas)) {
-    cand <- list.files(".", pattern = "manhattan_gwas.*\\.pdf", full.names = TRUE)
-    if (length(cand)) file.rename(cand[1], mht_gwas)
-}
+setwd(old_wd)
+# CMplot names file Rect_Manhtn.gwas_salt.pdf — rename to declared output
+cand <- list.files(outdir, pattern = "Rect_Manhtn\\.gwas_salt\\.pdf", full.names = TRUE)
+if (length(cand)) file.rename(cand[1], mht_gwas)
 
-# QQ plot
+# QQ plot — write to outdir then rename
 message("[plots] Drawing QQ plot")
-pdf(qq_out, width = 6, height = 6)
+setwd(outdir)
 CMplot(
     gwas_plt,
-    type      = "p",
-    plot.type = "q",
-    conf.int  = TRUE,
+    type         = "p",
+    plot.type    = "q",
+    conf.int     = TRUE,
     conf.int.col = "#00000033",
-    file.output = FALSE,
-    verbose = FALSE
+    file         = "pdf",
+    file.name    = "qq_gwas",
+    file.output  = TRUE,
+    verbose      = FALSE
 )
-title(sub = sprintf("λ = %.3f", lambda), cex.sub = 0.9)
-dev.off()
+setwd(old_wd)
+cand_qq <- list.files(outdir, pattern = "QQplot\\.qq_gwas\\.pdf", full.names = TRUE)
+if (length(cand_qq)) file.rename(cand_qq[1], qq_out)
 
 # ── 2. Fst Manhattan ─────────────────────────────────────────────────────────
 message("[plots] Reading per-SNP Fst: ", fst_snp_file)
@@ -117,7 +120,7 @@ if (!is.null(fst_chr_map)) {
     fst_plt <- fst[, .(SNP = paste0(CHROM, ":", POS), Chr = CHROM, Pos = POS, FST = FST)]
 }
 
-pdf(mht_fst, width = 14, height = 5)
+setwd(outdir)
 CMplot(
     fst_plt,
     type            = "p",
@@ -129,11 +132,14 @@ CMplot(
     amplify         = TRUE,
     signal.col      = "red",
     ylab            = expression(F[ST]),
-    file.output     = FALSE,
+    file            = "pdf",
+    file.name       = "fst_persnp",
+    file.output     = TRUE,
     verbose         = FALSE
 )
-title(main = "Per-SNP Fst (salt-tolerant vs intolerant)")
-dev.off()
+setwd(old_wd)
+cand_fst <- list.files(outdir, pattern = "Rect_Manhtn\\.fst_persnp\\.pdf", full.names = TRUE)
+if (length(cand_fst)) file.rename(cand_fst[1], mht_fst)
 
 # ── 3. PCA plot ───────────────────────────────────────────────────────────────
 message("[plots] Drawing PCA plot")
