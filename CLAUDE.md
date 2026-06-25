@@ -34,6 +34,11 @@ When a user describes a dataset and experimental design, you:
 | `scrnaseq` | Single-cell RNA-seq clustering + markers | STARsolo, scDblFinder, Scanpy, Leiden |
 | `wgs_snp` | WGS SNP/INDEL calling (non-model organisms) | fastp, BWA-MEM2, DeepVariant (GPU), GLnexus, SNPeff |
 | `snp_association` | SNP-trait GWAS + Fst scan (binary phenotype, related individuals) | PLINK2, GEMMA LMM, VCFtools Fst, CMplot |
+| `genomic_prediction` | Genomic ML prediction with 5-fold stratified CV (binary phenotype) | PLINK2, rrBLUP (GBLUP), glmnet (LASSO), ranger (RF), XGBoost |
+| `spatial` | Spatial transcriptomics: QC → Cluster → SVG → Deconvolution → Spatial stats | Scanpy, Squidpy, cell2location, LIANA |
+| `pool_seq` | Pool-seq allele frequency + Fst scan (pooled DNA, no replication) | fastp, BWA-MEM2, bcftools, Hudson Fst (R) |
+| `metagenome` | HiFi metagenomics: taxonomy + MAG reconstruction + functional annotation | Kraken2, hifiasm-meta, MetaBAT2, SemiBin2, CheckM2, GTDB-Tk, Pyrodigal, DIAMOND |
+| `report` | Universal HTML report generator for any completed workflow | MultiQC, pandas, matplotlib, seaborn, Jinja2 |
 
 ## Key Paths
 
@@ -45,6 +50,9 @@ Databases       : /home/cylin/Vet_Hamaguri/databases/
   eggNOG        : .../databases/eggnog_data
   InterProScan  : .../databases/interproscan-5.73-104.0
   FCS-GX        : /home/cylin/Vet_Hamaguri/FCS_DB
+  Kraken2 DB    : .../databases/kraken2_db          (metagenome)
+  CheckM2 DB    : .../databases/checkm2_db          (metagenome)
+  GTDB-Tk DB    : .../databases/gtdbtk_db           (metagenome)
 ```
 
 ## Conversation Protocol
@@ -70,3 +78,14 @@ Databases       : /home/cylin/Vet_Hamaguri/databases/
 
 **NEVER run `run_workflow` without explicit user approval.**
 **ALWAYS use `dry_run=True` to preview before the real run when uncertain.**
+
+## Workflow Development Checklist
+
+When helping develop or modify a new workflow rule, reference `/home/cylin/hermes/PIPELINE_CHECKLIST.md` and walk through its gates before recommending a full run:
+
+1. **Docker gate** — every `docker run` must have `--user $(id -u):$(id -g)`
+2. **Tool behavior gate** — manually test each new tool on a single small chromosome before integrating
+3. **Rule design gate** — `set -euo pipefail` + `test -s` output validation in every shell block
+4. **Config sync gate** — version numbers match in Snakefile, config_template.yaml, and INSTALL.md
+5. **Pilot test gate** — 2 samples × 3 smallest scaffolds before full run
+6. **Monitor gate** — PID file live, notify watchers running, test notification received

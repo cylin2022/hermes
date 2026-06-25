@@ -1,3 +1,4 @@
+import sys
 """
 RNA-seq differential expression pipeline
 FastQC → fastp → STAR 2-pass → featureCounts → DESeq2 + clusterProfiler
@@ -36,6 +37,14 @@ STAR_INDEX = str(OUTDIR / "star_index")
 CONTRASTS  = [f"{c[0]}_vs_{c[1]}" for c in COMPARISONS]
 
 # ── Target rule ───────────────────────────────────────────────────────────────
+# ── Preflight: resource check before any job starts ───────────────────────────
+onstart:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
+    from preflight import preflight
+    preflight(config, workflow_name="rnaseq")
+
+
 rule all:
     input:
         str(OUTDIR / "multiqc" / "multiqc_report.html"),

@@ -1,0 +1,22 @@
+name: genomic_ml
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - r-base=4.3
+  - r-rrblup          # GBLUP: A.mat(), kin.blup()
+  - r-glmnet          # LASSO logistic regression
+  - r-ranger          # Random Forest (fast, probability output)
+  - r-xgboost         # XGBoost
+  - r-proc            # AUC-ROC (pROC)
+  - r-data.table      # fast file I/O
+  - r-ggplot2
+  - r-cowplot         # multi-panel plot layout
+  - r-dplyr
+  - r-tidyr
+  - r-scales          # axis formatting
+  - r-knitr
+  - r-rmarkdown
+  - plink2
+  - pandoc            # HTML report rendering

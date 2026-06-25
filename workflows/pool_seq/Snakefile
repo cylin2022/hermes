@@ -1,0 +1,153 @@
+from pathlib import Path
+import sys
+import pandas as pd
+
+# ── config ────────────────────────────────────────────────────────────────────
+SS_DF       = pd.read_csv(config["samplesheet"])
+SAMPLES     = SS_DF["sample"].tolist()
+R1          = {r.sample: r.r1  for r in SS_DF.itertuples()}
+R2          = {r.sample: r.r2  for r in SS_DF.itertuples()}
+POOL_SIZE   = {r.sample: int(r.pool_size) for r in SS_DF.itertuples()}
+
+GENOME      = config["genome_fasta"]
+THREADS     = config["threads"]
+MIN_QUAL    = config.get("min_qual",        20)
+MIN_COV     = config.get("min_coverage",    20)
+MAX_COV     = config.get("max_coverage",   300)
+WINDOW      = config.get("window_size",  50000)
+STEP        = config.get("step_size",    10000)
+OUTDIR      = config["outdir"]
+COMPARISONS = config["comparisons"]
+COMP_NAMES  = [c["name"] for c in COMPARISONS]
+
+# ── all ───────────────────────────────────────────────────────────────────────
+# ── Preflight: resource check before any job starts ───────────────────────────
+onstart:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
+    from preflight import preflight
+    preflight(config, workflow_name="pool_seq")
+
+
+rule all:
+    input:
+        expand(f"{OUTDIR}/fst/{{comp}}_manhattan.pdf",  comp=COMP_NAMES),
+        expand(f"{OUTDIR}/fst/{{comp}}_windows.tsv",    comp=COMP_NAMES),
+        expand(f"{OUTDIR}/fst/{{comp}}_top_snps.tsv",   comp=COMP_NAMES),
+
+# ── QC + trim ─────────────────────────────────────────────────────────────────
+rule fastp:
+    input:
+        r1=lambda wc: R1[wc.sample],
+        r2=lambda wc: R2[wc.sample],
+    output:
+        r1=temp(f"{OUTDIR}/trimmed/{{sample}}_R1.fq.gz"),
+        r2=temp(f"{OUTDIR}/trimmed/{{sample}}_R2.fq.gz"),
+        html=f"{OUTDIR}/qc/{{sample}}_fastp.html",
+        json=f"{OUTDIR}/qc/{{sample}}_fastp.json",
+    threads: 8
+    resources: mem_mb = 8 * 1024
+    conda: "envs/align.yaml"
+    shell:
+        """
+        fastp -i {input.r1} -I {input.r2} \
+              -o {output.r1} -O {output.r2} \
+              --html {output.html} --json {output.json} \
+              --thread {threads} \
+              --detect_adapter_for_pe \
+              --qualified_quality_phred 20 \
+              --length_required 50
+        """
+
+# ── genome index ──────────────────────────────────────────────────────────────
+rule bwa_index:
+    input: GENOME
+    output: multiext(GENOME, ".0123", ".amb", ".ann", ".bwt.2bit.64", ".pac")
+    threads: 4
+    conda: "envs/align.yaml"
+    shell: "bwa-mem2 index {input}"
+
+# ── align ─────────────────────────────────────────────────────────────────────
+rule bwa_align:
+    input:
+        r1=f"{OUTDIR}/trimmed/{{sample}}_R1.fq.gz",
+        r2=f"{OUTDIR}/trimmed/{{sample}}_R2.fq.gz",
+        idx=multiext(GENOME, ".0123", ".amb", ".ann", ".bwt.2bit.64", ".pac"),
+    output:
+        bam=f"{OUTDIR}/bam/{{sample}}.bam",
+        bai=f"{OUTDIR}/bam/{{sample}}.bam.bai",
+    threads: THREADS
+    resources: mem_mb = 32 * 1024
+    conda: "envs/align.yaml"
+    shell:
+        """
+        bwa-mem2 mem -t {threads} \
+            -R '@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}\\tPL:ILLUMINA' \
+            {GENOME} {input.r1} {input.r2} \
+        | samtools sort -@ 4 -m 4G -o {output.bam}
+        samtools index {output.bam}
+        """
+
+# ── variant calling (all pools jointly) ───────────────────────────────────────
+# bcftools mpileup | call: pools are treated as separate "samples".
+# We only use the AD (allele depth) field — not the genotype calls —
+# because diploid GT calling is invalid for pooled samples.
+rule call_variants:
+    input:
+        bams=expand(f"{OUTDIR}/bam/{{sample}}.bam", sample=SAMPLES),
+        bais=expand(f"{OUTDIR}/bam/{{sample}}.bam.bai", sample=SAMPLES),
+        ref=GENOME,
+    output:
+        vcf=f"{OUTDIR}/variants/pools.vcf.gz",
+        tbi=f"{OUTDIR}/variants/pools.vcf.gz.tbi",
+    threads: THREADS
+    resources: mem_mb = 32 * 1024
+    conda: "envs/align.yaml"
+    shell:
+        """
+        bcftools mpileup \
+            -f {input.ref} \
+            -a AD,DP \
+            -q {MIN_QUAL} -Q {MIN_QUAL} \
+            --no-BAQ \
+            --threads {threads} \
+            -Ou \
+            {input.bams} \
+        | bcftools call -m -v -Oz -o {output.vcf}
+        bcftools index -t {output.vcf}
+        """
+
+# ── extract allele depths as flat TSV ────────────────────────────────────────
+rule extract_ad:
+    input: vcf=f"{OUTDIR}/variants/pools.vcf.gz"
+    output: ad=f"{OUTDIR}/variants/pools_ad.tsv.gz"
+    conda: "envs/align.yaml"
+    shell:
+        """
+        bcftools query \
+            -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%AD]\\n' \
+            -i 'TYPE="snp" && N_ALT=1' \
+            {input.vcf} \
+        | bgzip -c > {output.ad}
+        """
+
+# ── Fst (one job per comparison) ──────────────────────────────────────────────
+rule fst_analysis:
+    input:
+        ad=f"{OUTDIR}/variants/pools_ad.tsv.gz",
+    output:
+        windows=f"{OUTDIR}/fst/{{comp}}_windows.tsv",
+        top_snps=f"{OUTDIR}/fst/{{comp}}_top_snps.tsv",
+        pdf=f"{OUTDIR}/fst/{{comp}}_manhattan.pdf",
+    params:
+        comparison  = lambda wc: next(c for c in COMPARISONS if c["name"] == wc.comp),
+        samples     = SAMPLES,
+        pool_sizes  = [POOL_SIZE[s] for s in SAMPLES],
+        window      = WINDOW,
+        step        = STEP,
+        min_cov     = MIN_COV,
+        max_cov     = MAX_COV,
+    threads: 4
+    resources: mem_mb = 16 * 1024
+    conda: "envs/r_fst.yaml"
+    script: "scripts/fst_analysis.R"

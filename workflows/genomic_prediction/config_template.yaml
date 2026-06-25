@@ -1,0 +1,32 @@
+# Genomic Prediction Configuration
+# 5-fold stratified CV with GBLUP, LASSO, Random Forest, XGBoost
+# Input: filtered joint VCF (output of wgs_snp workflow)
+
+# ── Input ─────────────────────────────────────────────────────────────────────
+vcf: "/path/to/joint_filtered.vcf.gz"       # SNP-filtered VCF from wgs_snp/snp_association
+
+# Phenotype CSV: two columns, no header required
+#   sample_id,phenotype   (1 = salt-tolerant, 0 = salt-intolerant)
+#   sample IDs must match VCF sample names exactly
+phenotype: "/path/to/phenotype.csv"
+
+# ── Output ────────────────────────────────────────────────────────────────────
+outdir: "/path/to/output"
+
+# ── SNP QC filters ────────────────────────────────────────────────────────────
+maf:  0.05     # minor allele frequency threshold
+geno: 0.1      # max missingness per SNP
+mind: 0.1      # max missingness per sample
+hwe:  1.0e-6   # Hardy-Weinberg equilibrium p-value threshold
+
+# ── LD pruning (for genomic prediction, use relaxed r² to retain more signal) ─
+ld_window: 50   # window size (variant count)
+ld_step:   10   # step size
+ld_r2:     0.8  # r² threshold (0.8 = relaxed; GWAS typically uses 0.2)
+
+# ── Cross-validation ──────────────────────────────────────────────────────────
+n_folds: 5     # number of CV folds (stratified by phenotype)
+seed:    42    # random seed for reproducibility
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+threads: 16

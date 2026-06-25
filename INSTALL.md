@@ -185,31 +185,167 @@ docker run --rm ncbi/fcs-gx:latest python3 /app/bin/run_fcsadaptor.py --help
 BUSCO downloads the selected lineage database automatically when first run.
 If offline / air-gapped, pre-download manually:
 
-```bash
-# Example: vertebrata
-busco --download vertebrata_odb10 --download_path "$DB_BASE/busco_lineages"
+**IMPORTANT — version compatibility:**
+- odb10 datasets → requires BUSCO v5 (`busco=5.7.1` in `envs/busco.yaml`)
+- odb12 datasets → requires BUSCO v6 (`busco=6.0.0` in `envs/busco.yaml`)
 
-# Other common lineages:
-# actinopterygii_odb10  (ray-finned fish)
-# embryophyta_odb10     (plants)
-# insecta_odb10
-# mammalia_odb10
+The `envs/busco.yaml` currently uses **BUSCO v6.0.0** (odb12-compatible).
+
+```bash
+# Example: vertebrata (odb12, requires BUSCO v6)
+busco --download vertebrata_odb12 --download_path "$DB_BASE/busco_lineages"
+
+# Other common lineages (odb12):
+# actinopterygii_odb12  (ray-finned fish)
+# mollusca_odb12        (mollusks)
+# embryophyta_odb12     (plants)
+# insecta_odb12
+# mammalia_odb12
+```
+
+---
+
+### 4.6 Kraken2 Standard Database — taxonomic profiling
+
+Used by: `metagenome` (Module A)
+Size: ~85 GB
+Time: ~4 h download + ~30 min build
+
+```bash
+mkdir -p "$DB_BASE/kraken2_db"
+
+# Option A: pre-built standard database (fastest)
+wget -c "https://genome-idx.s3.amazonaws.com/kraken/k2_standard_20240605.tar.gz" \
+    -O "$DB_BASE/kraken2_db/k2_standard.tar.gz"
+tar -xzf "$DB_BASE/kraken2_db/k2_standard.tar.gz" -C "$DB_BASE/kraken2_db/"
+
+# Option B: build from scratch (ensures latest taxonomy)
+# mamba install -c bioconda kraken2 bracken
+# kraken2-build --standard --db "$DB_BASE/kraken2_db" --threads 64
+# bracken-build -d "$DB_BASE/kraken2_db" -t 64 -l 150
+
+# Verify
+ls "$DB_BASE/kraken2_db"   # should show hash.k2d  opts.k2d  taxo.k2d
+
+# Update metagenome config:
+# kraken2_db: "/home/cylin/Vet_Hamaguri/databases/kraken2_db"
+```
+
+---
+
+### 4.7 CheckM2 Database — MAG quality assessment
+
+Used by: `metagenome` (Module B)
+Size: ~3.5 GB
+Time: ~20 min download
+
+```bash
+mkdir -p "$DB_BASE/checkm2_db"
+mamba install -c bioconda checkm2
+
+# Download using the built-in command
+checkm2 database --download --path "$DB_BASE/checkm2_db"
+
+# Verify
+ls "$DB_BASE/checkm2_db"   # should show uniref100.KO.1.dmnd
+
+# Update metagenome config:
+# checkm2_db: "/home/cylin/Vet_Hamaguri/databases/checkm2_db"
+```
+
+---
+
+### 4.8 GTDB-Tk r220 Database — MAG taxonomy
+
+Used by: `metagenome` (Module B)
+Size: ~110 GB
+Time: ~6 h download
+
+```bash
+mkdir -p "$DB_BASE/gtdbtk_db"
+mamba install -c bioconda gtdbtk
+
+# Download r220 (latest as of 2024)
+wget -c "https://data.ace.uq.edu.au/public/gtdb/data/releases/release220/220.0/auxillary_files/gtdbtk_package/full_package/gtdbtk_r220_data.tar.gz" \
+    -O "$DB_BASE/gtdbtk_db/gtdbtk_r220_data.tar.gz"
+tar -xzf "$DB_BASE/gtdbtk_db/gtdbtk_r220_data.tar.gz" -C "$DB_BASE/gtdbtk_db/" --strip-components 1
+
+# Set env variable for manual runs (Snakemake workflow sets it automatically)
+export GTDBTK_DATA_PATH="$DB_BASE/gtdbtk_db"
+
+# Verify
+gtdbtk check_install   # should print 'gtdbtk v2.x.x — OK'
+
+# Update metagenome config:
+# gtdbtk_db: "/home/cylin/Vet_Hamaguri/databases/gtdbtk_db"
+```
+
+---
+
+### 4.9 Human T2T reference (optional — gut metagenome host removal)
+
+Used by: `metagenome` (host_removal step, only for samples with host_genome set)
+Size: ~3 GB
+Time: ~10 min download
+
+```bash
+mkdir -p "$DB_BASE/host_genomes"
+wget -c "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/009/914/755/GCA_009914755.4_T2T-CHM13v2.0/GCA_009914755.4_T2T-CHM13v2.0_genomic.fna.gz" \
+    -O "$DB_BASE/host_genomes/chm13v2.0.fa.gz"
+gunzip "$DB_BASE/host_genomes/chm13v2.0.fa.gz"
+
+# Add to samples.csv for human gut samples:
+# gut_01,/path/to/gut_01.hifi.fastq.gz,/home/cylin/Vet_Hamaguri/databases/host_genomes/chm13v2.0.fa
+# Leave host_genome blank for soil/environmental samples
 ```
 
 ---
 
 ## 5. DeepVariant Docker Image (wgs_snp)
 
+Use the GPU image (`1.10.0-gpu` or later). The older `1.6.1` image exits with code 1 even on success, causing Snakemake to delete all outputs in an infinite failure loop. `1.10.0-gpu` also internalizes tabix indexing, so the Snakefile uses `tabix -f` to force-overwrite the index.
+
 ```bash
-docker pull google/deepvariant:1.6.1
+docker pull google/deepvariant:1.10.0-gpu
 # Verify GPU access inside container
-docker run --rm --gpus all google/deepvariant:1.6.1 \
+docker run --rm --gpus all google/deepvariant:1.10.0-gpu \
     python3 -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
 ```
 
 ---
 
-## 6. MCP Server Setup (Claude Code integration)
+## 6. Platform Auto-Configuration (run once per machine)
+
+After all software and databases are installed, run the platform configurator to detect your hardware and generate an optimized config for this machine:
+
+```bash
+cd /path/to/hermes
+
+# Quick check (skips GPU container test, takes ~2s)
+python3 hermes_configure.py --skip-gpu-test
+
+# Full check including GPU passthrough validation (~30s)
+python3 hermes_configure.py
+
+# Write optimized config directly to a file
+python3 hermes_configure.py --workflow wgs_snp --output my_server_config.yaml
+```
+
+The script reports:
+- CPU cores, RAM, GPU model/VRAM
+- Whether Docker is installed and the current user is in the `docker` group
+- Whether the NVIDIA Container Toolkit can pass GPUs into containers
+- Recommended `threads`, `dv_shards`, and `mem_gb` values for this machine
+
+**Key insight**: `threads` controls CPU-based tools (BWA-MEM2, samtools). `dv_shards` controls DeepVariant's internal parallelism. They are set independently so GPU jobs never wait for CPU slots to be free.
+
+If Docker group membership fails:
+```bash
+sudo usermod -aG docker $USER
+newgrp docker        # or log out and back in
+```
+
+## 7. MCP Server Setup (Claude Code integration)
 
 The MCP server allows Claude Code to launch and monitor workflows via conversation.
 
@@ -242,7 +378,10 @@ After all downloads, update each workflow's `config_template.yaml` with the actu
 | `nr_diamond_db` | `genome_annotation/config_template.yaml` | `$DB_BASE/nr.dmnd` |
 | `interproscan_dir` | `genome_annotation/config_template.yaml` | `$DB_BASE/interproscan-5.73-104.0` |
 | `eggnog_data_dir` | `genome_annotation/config_template.yaml` | `$DB_BASE/eggnog_data` |
-| `dv_docker_image` | `wgs_snp/config_template.yaml` | `google/deepvariant:1.6.1` |
+| `dv_docker_image` | `wgs_snp/config_template.yaml` | `google/deepvariant:1.10.0-gpu` |
+| `kraken2_db` | `metagenome/config.yaml` | `$DB_BASE/kraken2_db` |
+| `checkm2_db` | `metagenome/config.yaml` | `$DB_BASE/checkm2_db` |
+| `gtdbtk_db` | `metagenome/config.yaml` | `$DB_BASE/gtdbtk_db` |
 
 ---
 
@@ -273,4 +412,8 @@ If Snakemake prints a job list without errors, the installation is correct.
 | FCS-GX | — | ~100 GB |
 | BUSCO lineages (all) | — | ~5 GB |
 | DeepVariant image | — | ~3 GB |
-| **Total** | | **~640 GB** |
+| Kraken2 Standard DB | — | ~85 GB |
+| CheckM2 DB | — | ~3.5 GB |
+| GTDB-Tk r220 | — | ~110 GB |
+| Human T2T (optional) | — | ~3 GB |
+| **Total (all)** | | **~840 GB** |

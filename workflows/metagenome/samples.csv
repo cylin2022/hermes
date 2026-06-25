@@ -1,0 +1,5 @@
+sample,fastq,host_genome
+gut_01,/path/to/data/gut_01.hifi.fastq.gz,/path/to/ref/chm13v2.0.fa
+gut_02,/path/to/data/gut_02.hifi.fastq.gz,/path/to/ref/chm13v2.0.fa
+soil_01,/path/to/data/soil_01.hifi.fastq.gz,
+soil_02,/path/to/data/soil_02.hifi.fastq.gz,

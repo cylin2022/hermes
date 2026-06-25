@@ -1,0 +1,249 @@
+import sys
+"""
+Spatial Transcriptomics Pipeline
+Platforms : 10x Visium | Visium HD | Xenium
+Steps     : QC → Normalize/Cluster → SVG (Moran's I) →
+            Deconvolution (cell2location, optional) → Spatial Stats (Squidpy)
+"""
+
+from pathlib import Path
+import csv
+
+# ── Samplesheet ───────────────────────────────────────────────────────────────
+# CSV header: sample,data_dir,platform
+def _read_samplesheet(path):
+    ss = {}
+    with open(path) as fh:
+        for row in csv.DictReader(fh):
+            sid = row["sample"].strip()
+            ss[sid] = {
+                "data_dir" : row["data_dir"].strip(),
+                "platform" : row["platform"].strip().lower(),
+            }
+    if not ss:
+        raise ValueError(f"Samplesheet '{path}' has no valid rows")
+    return ss
+
+_SS     = _read_samplesheet(config["samplesheet"])
+SAMPLES = list(_SS.keys())
+
+# ── Config ────────────────────────────────────────────────────────────────────
+OUTDIR       = Path(config["outdir"])
+THREADS      = int(config.get("threads", 16))
+MEM_GB       = int(config.get("mem_gb", 64))
+
+MIN_COUNTS   = int(config.get("min_counts", 500))
+MIN_GENES    = int(config.get("min_genes", 200))
+MAX_COUNTS   = int(config.get("max_counts", 50000))
+MAX_MT_PCT   = float(config.get("max_mt_pct", 25))
+MT_PREFIX    = config.get("mt_prefix", "MT-")
+
+N_HVG        = int(config.get("n_hvg", 3000))
+N_PCS        = int(config.get("n_pcs", 30))
+N_NEIGHBORS  = int(config.get("n_neighbors", 15))
+RESOLUTION   = float(config.get("resolution", 0.5))
+SPATIAL_K    = int(config.get("spatial_n_neighbors", 6))
+
+N_SVG        = int(config.get("n_svg", 200))
+SVG_JOBS     = int(config.get("svg_n_jobs", THREADS))
+
+RUN_DECONV   = str(config.get("run_deconvolution", "false")).lower() == "true"
+REF_H5AD     = config.get("reference_h5ad", "")
+CELLTYPE_COL = config.get("deconv_celltype_col", "celltype")
+N_CELLS_LOC  = int(config.get("n_cells_per_location", 5))
+DET_ALPHA    = float(config.get("detection_alpha", 20))
+
+RUN_NHOOD    = str(config.get("run_nhood_enrichment", "true")).lower()
+RUN_CO_OCC   = str(config.get("run_co_occurrence", "true")).lower()
+RUN_RIPLEY   = str(config.get("run_ripley", "false")).lower()
+CO_INTERVAL  = int(config.get("co_occurrence_interval", 50))
+
+SCRIPTS      = Path(workflow.basedir) / "scripts"
+
+
+# ── Target rule ───────────────────────────────────────────────────────────────
+# ── Preflight: resource check before any job starts ───────────────────────────
+onstart:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
+    from preflight import preflight
+    preflight(config, workflow_name="spatial")
+
+
+rule all:
+    input:
+        expand(str(OUTDIR / "{sample}" / "{sample}_final.h5ad"),
+               sample=SAMPLES),
+        expand(str(OUTDIR / "{sample}" / "{sample}_svg_top.csv"),
+               sample=SAMPLES),
+        expand(str(OUTDIR / "{sample}" / "{sample}_deconv.h5ad"),
+               sample=SAMPLES) if RUN_DECONV else [],
+
+
+# ── Step 1: QC & filter ───────────────────────────────────────────────────────
+rule qc_filter:
+    input:
+        # Use ancient() so Snakemake doesn't re-run when the Space Ranger directory
+        # timestamp changes (directories don't track content changes reliably).
+        data_dir = lambda wc: ancient(_SS[wc.sample]["data_dir"]),
+    output:
+        h5ad    = str(OUTDIR / "{sample}" / "{sample}_qc.h5ad"),
+        summary = str(OUTDIR / "{sample}" / "{sample}_qc_summary.txt"),
+    params:
+        platform    = lambda wc: _SS[wc.sample]["platform"],
+        outdir      = str(OUTDIR / "{sample}"),
+        min_counts  = MIN_COUNTS,
+        min_genes   = MIN_GENES,
+        max_counts  = MAX_COUNTS,
+        max_mt_pct  = MAX_MT_PCT,
+        mt_prefix   = MT_PREFIX,
+    threads: 4
+    resources:
+        mem_mb = MEM_GB * 1024 // 4,
+    conda: "envs/spatial_core.yaml"
+    shell: """
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        python {SCRIPTS}/01_qc_filter.py \
+            {input.data_dir} \
+            {params.platform} \
+            {wildcards.sample} \
+            {params.outdir} \
+            {params.min_counts} \
+            {params.min_genes} \
+            {params.max_counts} \
+            {params.max_mt_pct} \
+            {params.mt_prefix}
+        test -s {output.h5ad}
+    """
+
+
+# ── Step 2: Normalize & cluster ───────────────────────────────────────────────
+rule normalize_cluster:
+    input:
+        h5ad = str(OUTDIR / "{sample}" / "{sample}_qc.h5ad"),
+    output:
+        h5ad    = str(OUTDIR / "{sample}" / "{sample}_clustered.h5ad"),
+        summary = str(OUTDIR / "{sample}" / "{sample}_cluster_summary.txt"),
+    params:
+        outdir      = str(OUTDIR / "{sample}"),
+        n_hvg       = N_HVG,
+        n_pcs       = N_PCS,
+        n_neighbors = N_NEIGHBORS,
+        resolution  = RESOLUTION,
+        spatial_k   = SPATIAL_K,
+        seed        = 42,
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/spatial_core.yaml"
+    shell: """
+        set -euo pipefail
+        python {SCRIPTS}/02_normalize_cluster.py \
+            {input.h5ad} \
+            {wildcards.sample} \
+            {params.outdir} \
+            {params.n_hvg} \
+            {params.n_pcs} \
+            {params.n_neighbors} \
+            {params.resolution} \
+            {params.spatial_k} \
+            {params.seed}
+        test -s {output.h5ad}
+    """
+
+
+# ── Step 3: Spatially variable genes (Moran's I) ─────────────────────────────
+rule svg_analysis:
+    input:
+        h5ad = str(OUTDIR / "{sample}" / "{sample}_clustered.h5ad"),
+    output:
+        svg  = str(OUTDIR / "{sample}" / "{sample}_svg_top.csv"),
+        all  = str(OUTDIR / "{sample}" / "{sample}_moranI_all.csv"),
+    params:
+        outdir = str(OUTDIR / "{sample}"),
+        n_svg  = N_SVG,
+        n_jobs = SVG_JOBS,
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/spatial_core.yaml"
+    shell: """
+        set -euo pipefail
+        python {SCRIPTS}/03_svg_analysis.py \
+            {input.h5ad} \
+            {wildcards.sample} \
+            {params.outdir} \
+            {params.n_svg} \
+            {params.n_jobs}
+        test -s {output.svg}
+    """
+
+
+# ── Step 4: Cell type deconvolution (cell2location) ───────────────────────────
+if RUN_DECONV:
+    rule deconvolution:
+        input:
+            h5ad_spatial = str(OUTDIR / "{sample}" / "{sample}_clustered.h5ad"),
+            h5ad_ref     = REF_H5AD,
+        output:
+            h5ad = str(OUTDIR / "{sample}" / "{sample}_deconv.h5ad"),
+        params:
+            outdir        = str(OUTDIR / "{sample}"),
+            celltype_col  = CELLTYPE_COL,
+            n_cells_loc   = N_CELLS_LOC,
+            det_alpha     = DET_ALPHA,
+        threads: THREADS
+        resources:
+            mem_mb = MEM_GB * 1024,
+            gpu    = 1,
+        conda: "envs/cell2location.yaml"
+        shell: """
+            set -euo pipefail
+            python {SCRIPTS}/04_deconvolution.py \
+                {input.h5ad_spatial} \
+                {input.h5ad_ref} \
+                {params.celltype_col} \
+                {wildcards.sample} \
+                {params.outdir} \
+                {params.n_cells_loc} \
+                {params.det_alpha} \
+                {threads}
+            test -s {output.h5ad}
+        """
+
+
+# ── Step 5: Spatial statistics ────────────────────────────────────────────────
+def _stats_input(wc):
+    if RUN_DECONV:
+        return str(OUTDIR / wc.sample / f"{wc.sample}_deconv.h5ad")
+    return str(OUTDIR / wc.sample / f"{wc.sample}_clustered.h5ad")
+
+rule spatial_stats:
+    input:
+        h5ad = _stats_input,
+    output:
+        h5ad = str(OUTDIR / "{sample}" / "{sample}_final.h5ad"),
+    params:
+        outdir       = str(OUTDIR / "{sample}"),
+        run_nhood    = RUN_NHOOD,
+        run_co_occ   = RUN_CO_OCC,
+        run_ripley   = RUN_RIPLEY,
+        co_interval  = CO_INTERVAL,
+    threads: THREADS
+    resources:
+        mem_mb = MEM_GB * 1024,
+    conda: "envs/spatial_core.yaml"
+    shell: """
+        set -euo pipefail
+        python {SCRIPTS}/05_spatial_stats.py \
+            {input.h5ad} \
+            {wildcards.sample} \
+            {params.outdir} \
+            {params.run_nhood} \
+            {params.run_co_occ} \
+            {params.run_ripley} \
+            {params.co_interval} \
+            {threads}
+        test -s {output.h5ad}
+    """

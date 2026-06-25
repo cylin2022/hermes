@@ -1,0 +1,49 @@
+# ── Metagenome Workflow Config — PacBio HiFi ─────────────────────────────────
+# Usage:
+#   cd /path/to/project
+#   snakemake -s /home/cylin/hermes/workflows/metagenome/Snakefile \
+#       --use-conda --configfile metagenome_config.yaml \
+#       --cores 120 --keep-going --rerun-incomplete
+
+# Samplesheet CSV (columns: sample, fastq, host_genome)
+# host_genome column: path to host FASTA for decontamination, leave empty for soil/environment samples
+samples: "samples.csv"
+
+# ── Analysis modules ───────────────────────────────────────────────────────────
+modules:
+  taxonomic_profiling:  true   # Module A: Kraken2 + Bracken + Krona
+  mag_reconstruction:   true   # Module B: hifiasm-meta → binning → CheckM2 → GTDB-Tk
+  functional_annotation: true  # Module C: Pyrodigal → DIAMOND + eggNOG + InterProScan
+                                #           (requires mag_reconstruction: true)
+  # Report is a separate workflow: workflows/report/Snakefile
+
+# ── Assembly ───────────────────────────────────────────────────────────────────
+assembler:      hifiasm_meta   # hifiasm_meta | metaflye (metaflye: use --meta flag)
+min_contig_len: 2000           # bp; contigs shorter than this are discarded
+
+# ── Binning ────────────────────────────────────────────────────────────────────
+binners:
+  - metabat2
+  - semibin2
+semibin2_environment: global  # Preset model: human_gut | ocean | soil | wastewater | global
+
+# ── MAG quality thresholds (CheckM2) ──────────────────────────────────────────
+mag_quality:
+  min_completeness: 50   # %
+  max_contamination: 10  # %
+  # Quality tiers (MIMAG standard):
+  #   Near-complete: comp >= 90%, cont <= 5%
+  #   High-quality:  comp >= 50%, cont <= 10%
+  #   Medium-quality: comp >= 50%, cont <= 10% (default threshold)
+
+# ── Databases ──────────────────────────────────────────────────────────────────
+kraken2_db:       "/home/cylin/Vet_Hamaguri/databases/kraken2_db"
+checkm2_db:       "/home/cylin/Vet_Hamaguri/databases/checkm2_db"
+gtdbtk_db:        "/home/cylin/Vet_Hamaguri/databases/gtdbtk_db"
+diamond_db:       "/home/cylin/Vet_Hamaguri/databases/nr.dmnd"
+eggnog_db:        "/home/cylin/Vet_Hamaguri/databases/eggnog_data"
+interproscan_dir: "/home/cylin/Vet_Hamaguri/databases/interproscan-5.73-104.0"
+
+# ── Compute resources ──────────────────────────────────────────────────────────
+threads: 64    # Per-rule thread limit; Snakemake schedules concurrent jobs within --cores
+mem_gb:  256   # Used for hifiasm-meta memory cap (mem_mb = mem_gb * 800)

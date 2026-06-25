@@ -1,9 +1,19 @@
+# NOTE: This conda environment is NOT used for gene prediction.
+# BRAKER3 runs via Docker (teambraker/braker3:latest) because the conda
+# braker3=3.0.8 environment is missing Scalar::Util::Numeric (Perl module)
+# which causes braker.pl to crash with "Can't locate Scalar/Util/Numeric.pm".
+#
+# Required Docker image: teambraker/braker3:latest
+#   docker pull teambraker/braker3:latest
+#
+# busybox is also needed for the post-run chown step:
+#   docker pull busybox
+#
+# This file is kept as a placeholder so Snakemake does not error on
+# the --use-conda flag; it installs only lightweight utilities.
 name: braker4
 channels:
   - conda-forge
   - bioconda
 dependencies:
-  - braker3=3.0.8
-  - augustus=3.5.0
-  - bamtools=2.5.2
   - samtools=1.20

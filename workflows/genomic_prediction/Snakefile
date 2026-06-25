@@ -1,0 +1,202 @@
+import sys
+# Genomic Prediction Workflow
+# 5-fold stratified CV: GBLUP / LASSO / Random Forest / XGBoost
+# Input : filtered joint VCF (from wgs_snp + snp_association) + phenotype CSV
+# Output: cv_summary.csv, ROC curves, feature importance plots
+
+from pathlib import Path
+
+configfile: "config_template.yaml"
+
+OUTDIR   = Path(config["outdir"])
+THREADS  = int(config.get("threads", 16))
+N_FOLDS  = int(config.get("n_folds", 5))
+SEED     = int(config.get("seed", 42))
+MAF      = config.get("maf", 0.05)
+GENO     = config.get("geno", 0.1)
+MIND     = config.get("mind", 0.1)
+HWE      = float(config.get("hwe", 1e-6))
+LD_WIN   = int(config.get("ld_window", 50))
+LD_STEP  = int(config.get("ld_step", 10))
+LD_R2    = float(config.get("ld_r2", 0.8))
+SCRIPTS  = Path(workflow.basedir) / "scripts"
+
+
+# ── Preflight: resource check before any job starts ───────────────────────────
+onstart:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
+    from preflight import preflight
+    preflight(config, workflow_name="genomic_prediction")
+
+
+rule all:
+    input:
+        OUTDIR / "cv_summary.csv",
+        OUTDIR / "plots" / "auc_comparison.pdf",
+        OUTDIR / "plots" / "roc_curves.pdf",
+        OUTDIR / "plots" / "metrics_heatmap.pdf",
+
+
+# ── Step 1: SNP QC ────────────────────────────────────────────────────────────
+rule plink_qc:
+    input:
+        vcf = config["vcf"],
+    output:
+        bed = OUTDIR / "plink" / "qc.bed",
+        bim = OUTDIR / "plink" / "qc.bim",
+        fam = OUTDIR / "plink" / "qc.fam",
+    params:
+        prefix = str(OUTDIR / "plink" / "qc"),
+        maf    = MAF,
+        geno   = GENO,
+        mind   = MIND,
+        hwe    = HWE,
+    threads: THREADS
+    conda: "envs/genomic_ml.yaml"
+    shell: """
+        set -euo pipefail
+        mkdir -p {params.prefix%/*}
+        plink2 \
+            --vcf {input.vcf} \
+            --maf {params.maf} \
+            --geno {params.geno} \
+            --mind {params.mind} \
+            --hwe {params.hwe} \
+            --allow-extra-chr \
+            --set-missing-var-ids '@_#_$r_$a' \
+            --new-id-max-allele-len 50 \
+            --max-alleles 2 \
+            --make-bed \
+            --out {params.prefix} \
+            --threads {threads}
+        test -s {output.bed}
+    """
+
+
+# ── Step 2: LD pruning ────────────────────────────────────────────────────────
+rule plink_ld_prune:
+    input:
+        bed = OUTDIR / "plink" / "qc.bed",
+        bim = OUTDIR / "plink" / "qc.bim",
+        fam = OUTDIR / "plink" / "qc.fam",
+    output:
+        prune_in  = OUTDIR / "plink" / "pruned.prune.in",
+        prune_out = OUTDIR / "plink" / "pruned.prune.out",
+        bed       = OUTDIR / "plink" / "pruned.bed",
+        bim       = OUTDIR / "plink" / "pruned.bim",
+        fam       = OUTDIR / "plink" / "pruned.fam",
+        raw       = OUTDIR / "plink" / "pruned.raw",
+    params:
+        qc_prefix     = str(OUTDIR / "plink" / "qc"),
+        pruned_prefix = str(OUTDIR / "plink" / "pruned"),
+        ld_win  = LD_WIN,
+        ld_step = LD_STEP,
+        ld_r2   = LD_R2,
+    threads: THREADS
+    conda: "envs/genomic_ml.yaml"
+    shell: """
+        set -euo pipefail
+        # LD pruning: compute prune.in / prune.out lists
+        plink2 \
+            --bfile {params.qc_prefix} \
+            --indep-pairwise {params.ld_win} {params.ld_step} {params.ld_r2} \
+            --allow-extra-chr \
+            --out {params.pruned_prefix} \
+            --threads {threads}
+
+        # Extract pruned SNP set, recode to BED and additive-coded .raw
+        plink2 \
+            --bfile {params.qc_prefix} \
+            --extract {output.prune_in} \
+            --allow-extra-chr \
+            --make-bed \
+            --recode A \
+            --out {params.pruned_prefix} \
+            --threads {threads}
+
+        test -s {output.bed}
+        test -s {output.raw}
+    """
+
+
+# ── Step 3: PCA (for visualization) ──────────────────────────────────────────
+rule plink_pca:
+    input:
+        bed = OUTDIR / "plink" / "pruned.bed",
+        bim = OUTDIR / "plink" / "pruned.bim",
+        fam = OUTDIR / "plink" / "pruned.fam",
+    output:
+        eigenvec = OUTDIR / "plink" / "pca.eigenvec",
+        eigenval = OUTDIR / "plink" / "pca.eigenval",
+    params:
+        prefix = str(OUTDIR / "plink" / "pca"),
+        bed_prefix = str(OUTDIR / "plink" / "pruned"),
+    threads: THREADS
+    conda: "envs/genomic_ml.yaml"
+    shell: """
+        set -euo pipefail
+        plink2 \
+            --bfile {params.bed_prefix} \
+            --pca 10 \
+            --allow-extra-chr \
+            --out {params.prefix} \
+            --threads {threads}
+        test -s {output.eigenvec}
+    """
+
+
+# ── Step 4: Run all 4 models with 5-fold CV ───────────────────────────────────
+rule run_cv_models:
+    input:
+        raw      = OUTDIR / "plink" / "pruned.raw",
+        phenotype = config["phenotype"],
+    output:
+        summary  = OUTDIR / "cv_summary.csv",
+        metrics  = OUTDIR / "cv_metrics_full.rds",
+        folds    = OUTDIR / "cv_fold_assignments.rds",
+    params:
+        n_folds = N_FOLDS,
+        seed    = SEED,
+        outdir  = str(OUTDIR),
+    threads: THREADS
+    conda: "envs/genomic_ml.yaml"
+    shell: """
+        set -euo pipefail
+        Rscript {SCRIPTS}/run_cv_models.R \
+            {input.raw} \
+            {input.phenotype} \
+            {params.n_folds} \
+            {params.seed} \
+            {threads} \
+            {params.outdir}
+        test -s {output.summary}
+        test -s {output.metrics}
+    """
+
+
+# ── Step 5: Plot results ──────────────────────────────────────────────────────
+rule plot_results:
+    input:
+        summary  = OUTDIR / "cv_summary.csv",
+        metrics  = OUTDIR / "cv_metrics_full.rds",
+        eigenvec = OUTDIR / "plink" / "pca.eigenvec",
+        phenotype = config["phenotype"],
+    output:
+        auc_plot    = OUTDIR / "plots" / "auc_comparison.pdf",
+        roc_plot    = OUTDIR / "plots" / "roc_curves.pdf",
+        heat_plot   = OUTDIR / "plots" / "metrics_heatmap.pdf",
+    params:
+        outdir = str(OUTDIR),
+    threads: 1
+    conda: "envs/genomic_ml.yaml"
+    shell: """
+        set -euo pipefail
+        Rscript {SCRIPTS}/plot_results.R \
+            {input.summary} \
+            {input.metrics} \
+            {input.eigenvec} \
+            {input.phenotype} \
+            {params.outdir}
+        test -s {output.auc_plot}
+    """

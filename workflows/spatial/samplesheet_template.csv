@@ -1,0 +1,4 @@
+sample,data_dir,platform
+section1,/path/to/spaceranger_section1_output,visium
+section2,/path/to/spaceranger_section2_output,visium
+xenium_sample,/path/to/xenium_output_dir,xenium

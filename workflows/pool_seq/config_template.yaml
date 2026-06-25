@@ -1,0 +1,20 @@
+samplesheet: "samplesheet.csv"   # columns: sample, r1, r2, pool_size
+genome_fasta: ""                  # path to reference FASTA (same as wgs_snp)
+threads: 32
+min_qual: 20
+min_coverage: 20
+max_coverage: 300
+window_size: 50000                # sliding window size (bp)
+step_size: 10000                  # sliding window step (bp)
+outdir: "pool_seq_out"
+
+# Define pairwise comparisons.
+# pools_a / pools_b: lists of sample names from samplesheet.
+# Multiple pools per side are pooled by weighted mean (by pool_size).
+comparisons:
+  - name: "salt_tolerance"
+    pools_a: ["SL", "SS"]        # salt-intolerant
+    pools_b: ["TL", "TS"]        # salt-tolerant
+  - name: "body_size"
+    pools_a: ["SS", "TS"]        # small body
+    pools_b: ["SL", "TL"]        # large body

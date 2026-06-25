@@ -21,7 +21,10 @@ ploidy: 2                             # 2 = diploid (production); polyploid = ex
 # ── GPU / Docker settings ─────────────────────────────────────────────────────
 use_gpu: true                         # true = run DeepVariant via Docker + --gpus all (recommended)
                                       # false = use conda CPU package (slow, no Docker needed)
-dv_docker_image: "google/deepvariant:1.6.1"   # override to pin a specific version
+dv_docker_image: "google/deepvariant:1.10.0-gpu"   # 1.6.1 exits 1 even on success; use 1.10.0-gpu or later
+dv_shards: 64          # --num_shards inside DeepVariant container (make_examples parallelism)
+                       # Snakemake scheduling uses threads: 1 — concurrency is controlled
+                       # by resources: gpu=1, not CPU slots. DV runs whenever GPU is free.
 
 # ── Quality filters ───────────────────────────────────────────────────────────
 # DeepVariant outputs calibrated quality scores; simple GQ+DP filter is sufficient.

@@ -1,0 +1,5 @@
+sample,r1,r2,pool_size
+SL,/path/to/SL_R1.fastq.gz,/path/to/SL_R2.fastq.gz,30
+SS,/path/to/SS_R1.fastq.gz,/path/to/SS_R2.fastq.gz,30
+TL,/path/to/TL_R1.fastq.gz,/path/to/TL_R2.fastq.gz,30
+TS,/path/to/TS_R1.fastq.gz,/path/to/TS_R2.fastq.gz,30

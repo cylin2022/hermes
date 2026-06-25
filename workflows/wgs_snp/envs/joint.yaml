@@ -3,6 +3,6 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - glnexus=1.4.3
+  - glnexus=1.4.1
   - bcftools=1.19
   - htslib=1.19

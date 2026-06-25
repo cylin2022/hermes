@@ -9,6 +9,7 @@ Parent directories of the reference and BAM are bind-mounted at their host paths
 inside the container so no path translation is needed.
 """
 
+import sys
 from pathlib import Path
 
 # ── Samplesheet ───────────────────────────────────────────────────────────────
@@ -42,16 +43,29 @@ MIN_DP       = int(config.get("min_depth", 5))
 
 THREADS      = int(config.get("threads", 16))
 MEM_GB       = int(config.get("mem_gb", 64))
+# DV_SHARDS controls --num_shards inside the container; kept separate from THREADS
+# so Snakemake schedules DV as a lightweight CPU job (threads:4) and lets the GPU
+# run alongside BWA-MEM2 without waiting for 64 CPU slots to be free.
+DV_SHARDS    = int(config.get("dv_shards", THREADS))
 # GPU-enabled DeepVariant Docker image (set use_gpu: false to fall back to CPU conda)
 USE_GPU      = str(config.get("use_gpu", "true")).lower() == "true"
-DV_IMAGE     = config.get("dv_docker_image", "google/deepvariant:1.6.1")
+DV_IMAGE     = config.get("dv_docker_image", "google/deepvariant:1.10.0-gpu")
 
 GENOME_FAI   = GENOME + ".fai"
 ANNOT_FILE   = GTF if GTF else GFF
 ANNOT_TYPE   = "gtf22" if GTF else "gff3"
+ANNOT_EXT    = "gtf"   if GTF else "gff"    # SNPeff expects genes.gtf / genes.gff (not genes.gff3)
 
 wildcard_constraints:
     sample = "|".join(SAMPLES),
+
+# ── Preflight: resource check before any job starts ───────────────────────────
+onstart:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
+    from preflight import preflight
+    preflight(config, workflow_name="wgs_snp", needs_gpu=USE_GPU, needs_docker=True)
+
 
 # ── Target rule ───────────────────────────────────────────────────────────────
 rule all:
@@ -122,14 +136,18 @@ rule bwa_mem2:
         bam = temp(str(OUTDIR / "alignment" / "{sample}.namesorted.bam")),
     params:
         rg  = r"@RG\tID:{sample}\tSM:{sample}\tPL:ILLUMINA\tLB:{sample}",
+        ref = GENOME,
     threads: THREADS
     resources:
         mem_mb = MEM_GB * 1024,
     conda: "envs/align.yaml"
     shell:
         """
-        bwa-mem2 mem -t {threads} -R '{params.rg}' {GENOME} {input.r1} {input.r2} | \
+        set -euo pipefail
+        bwa-mem2 mem -t {threads} -R '{params.rg}' {params.ref} {input.r1} {input.r2} | \
+        samtools sort -n -@ {threads} -m 2G | \
         samtools fixmate -m -@ {threads} - {output.bam}
+        test -s {output.bam} || {{ echo "ERROR: namesorted BAM missing or empty" >&2; exit 1; }}
         """
 
 rule sort_markdup:
@@ -137,7 +155,7 @@ rule sort_markdup:
         bam = str(OUTDIR / "alignment" / "{sample}.namesorted.bam"),
     output:
         bam = temp(str(OUTDIR / "alignment" / "{sample}.markdup.bam")),
-        bai = temp(str(OUTDIR / "alignment" / "{sample}.markdup.bam.bai")),
+        bai = temp(str(OUTDIR / "alignment" / "{sample}.markdup.bam.csi")),
     threads: 8
     resources:
         mem_mb = 32 * 1024,
@@ -167,7 +185,7 @@ if USE_GPU:
     rule deepvariant:
         input:
             bam = str(OUTDIR / "alignment" / "{sample}.markdup.bam"),
-            bai = str(OUTDIR / "alignment" / "{sample}.markdup.bam.bai"),
+            bai = str(OUTDIR / "alignment" / "{sample}.markdup.bam.csi"),
             ref = GENOME,
             fai = GENOME_FAI,
         output:
@@ -179,7 +197,8 @@ if USE_GPU:
             outdir   = str(OUTDIR / "gvcf"),
             tmp_dir  = str(OUTDIR / "gvcf" / "{sample}_tmp"),
             ploidy   = PLOIDY,
-        threads: THREADS
+            shards   = DV_SHARDS,
+        threads: 1   # scheduling only; concurrency is controlled by resources: gpu=1, not CPU slots
         resources:
             mem_mb = MEM_GB * 1024,
             gpu    = 1,
@@ -187,6 +206,9 @@ if USE_GPU:
         shell:
             """
             set -euo pipefail
+            # Remove any leftover tmp dir from a previous failed run (may contain root-owned files
+            # from a run without --user that would block overwriting on retry)
+            rm -rf {params.tmp_dir}
             mkdir -p {params.outdir} {params.tmp_dir}
 
             REF_REAL=$(realpath {input.ref})
@@ -197,6 +219,7 @@ if USE_GPU:
             BAM_DIR=$(dirname $BAM_REAL)
 
             docker run --rm --gpus all \
+                --user $(id -u):$(id -g) \
                 -v "$REF_DIR:$REF_DIR:ro" \
                 -v "$BAM_DIR:$BAM_DIR:ro" \
                 -v "$OUT_REAL:$OUT_REAL" \
@@ -208,17 +231,25 @@ if USE_GPU:
                     --reads=$BAM_REAL \
                     --output_vcf=$OUT_REAL/{wildcards.sample}.vcf.gz \
                     --output_gvcf=$OUT_REAL/{wildcards.sample}.g.vcf.gz \
-                    --num_shards={threads} \
-                    --intermediate_results_dir=$TMP_REAL
+                    --num_shards={params.shards} \
+                    --intermediate_results_dir=$TMP_REAL \
+                || true  # DV 1.10.0 exits 1 when internal tabix fails; g.vcf.gz is complete
 
-            tabix -p vcf {output.gvcf}
+            # Verify g.vcf.gz was actually written (catches real failures)
+            test -s {output.gvcf} || {{ echo "ERROR: DeepVariant did not produce g.vcf.gz" >&2; exit 1; }}
+
+            # DV's internal tabix writes .g.vcf.gz.tbi as root even on failure;
+            # tabix (running as cylin) cannot open() a root-owned file for truncation,
+            # but can unlink it from a cylin-owned directory.
+            rm -f {output.idx}
+            tabix -f -p vcf {output.gvcf}
             rm -rf {params.tmp_dir}
             """
 else:
     rule deepvariant:
         input:
             bam = str(OUTDIR / "alignment" / "{sample}.markdup.bam"),
-            bai = str(OUTDIR / "alignment" / "{sample}.markdup.bam.bai"),
+            bai = str(OUTDIR / "alignment" / "{sample}.markdup.bam.csi"),
             ref = GENOME,
             fai = GENOME_FAI,
         output:
@@ -228,6 +259,7 @@ else:
         params:
             ploidy  = PLOIDY,
             tmp_dir = str(OUTDIR / "gvcf" / "{sample}_tmp"),
+            shards  = DV_SHARDS,
         threads: THREADS
         resources:
             mem_mb = MEM_GB * 1024,
@@ -241,9 +273,9 @@ else:
                 --reads={input.bam} \
                 --output_vcf={output.vcf} \
                 --output_gvcf={output.gvcf} \
-                --num_shards={threads} \
+                --num_shards={params.shards} \
                 --intermediate_results_dir={params.tmp_dir}
-            tabix -p vcf {output.gvcf}
+            tabix -f -p vcf {output.gvcf}
             rm -rf {params.tmp_dir}
             """
 
@@ -263,6 +295,7 @@ rule glnexus:
     conda: "envs/joint.yaml"
     shell:
         """
+        set -euo pipefail
         rm -rf {params.db}
         mkdir -p $(dirname {output.vcf})
         glnexus_cli \
@@ -273,6 +306,7 @@ rule glnexus:
             {input.gvcfs} | \
         bcftools view --output-type z --threads 4 --output {output.vcf}
         tabix -p vcf {output.vcf}
+        test -s {output.vcf} || {{ echo "ERROR: joint VCF missing or empty" >&2; exit 1; }}
         """
 
 # ── Filter by GQ and DP, then separate SNPs / INDELs ─────────────────────────
@@ -325,12 +359,13 @@ if ANNOT_FILE:
             species    = SPECIES_NAME,
             dbdir      = str(OUTDIR / "snpeff_db"),
             annot_type = ANNOT_TYPE,
+            annot_ext  = ANNOT_EXT,
         conda: "envs/annotation.yaml"
         shell:
             """
             mkdir -p {params.dbdir}/{params.species}
             ln -sf $(realpath {input.genome}) {params.dbdir}/{params.species}/sequences.fa
-            ln -sf $(realpath {input.annot})  {params.dbdir}/{params.species}/genes.{params.annot_type}
+            ln -sf $(realpath {input.annot})  {params.dbdir}/{params.species}/genes.{params.annot_ext}
 
             CONFIG={params.dbdir}/snpEff.config
             if ! grep -q "^{params.species}.genome" "$CONFIG" 2>/dev/null; then
@@ -340,6 +375,8 @@ if ANNOT_FILE:
             snpEff build \
                 -dataDir {params.dbdir} \
                 -{params.annot_type} \
+                -noCheckCds \
+                -noCheckProtein \
                 -v {params.species} \
                 -config "$CONFIG"
 

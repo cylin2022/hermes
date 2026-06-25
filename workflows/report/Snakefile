@@ -1,0 +1,238 @@
+import sys
+"""
+Universal Report Workflow
+Generates an HTML report from any completed Hermes analysis workflow.
+Supported workflow_type: metagenome | wgs_snp | rnaseq | scrnaseq
+
+Usage:
+    snakemake -s /home/cylin/hermes/workflows/report/Snakefile \
+        --use-conda --configfile report_config.yaml --cores 8
+"""
+
+import pandas as pd
+from pathlib import Path
+
+configfile: "config.yaml"
+
+WORKFLOW    = config["workflow_type"]
+RESULTS_DIR = config["results_dir"]
+OUTPUT_DIR  = config["output_dir"]
+PROJECT     = config.get("project_name", WORKFLOW)
+
+samples_df = pd.read_csv(config["samples"]).set_index("sample", drop=False)
+SAMPLES    = samples_df.index.tolist()
+
+# ── Master target ──────────────────────────────────────────────────────────────
+TARGETS = [f"{OUTPUT_DIR}/multiqc/multiqc_report.html"]
+
+if WORKFLOW == "metagenome":
+    TARGETS += [
+        f"{OUTPUT_DIR}/tables/mag_summary.tsv",
+        f"{OUTPUT_DIR}/tables/taxonomy_species.tsv",
+        f"{OUTPUT_DIR}/figures/mag_quality_scatter.png",
+        f"{OUTPUT_DIR}/figures/taxonomy_barplot.png",
+        f"{OUTPUT_DIR}/metagenome_report.html",
+    ]
+elif WORKFLOW == "wgs_snp":
+    TARGETS += [
+        f"{OUTPUT_DIR}/tables/variant_summary.tsv",
+        f"{OUTPUT_DIR}/figures/snp_titv.png",
+        f"{OUTPUT_DIR}/wgs_snp_report.html",
+    ]
+elif WORKFLOW == "rnaseq":
+    TARGETS += [
+        f"{OUTPUT_DIR}/tables/de_summary.tsv",
+        f"{OUTPUT_DIR}/figures/pca.png",
+        f"{OUTPUT_DIR}/rnaseq_report.html",
+    ]
+elif WORKFLOW == "scrnaseq":
+    TARGETS += [
+        f"{OUTPUT_DIR}/tables/cluster_summary.tsv",
+        f"{OUTPUT_DIR}/figures/umap.png",
+        f"{OUTPUT_DIR}/scrnaseq_report.html",
+    ]
+
+# ── Preflight: resource check before any job starts ───────────────────────────
+onstart:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
+    from preflight import preflight
+    preflight(config, workflow_name="report")
+
+
+rule all:
+    input: TARGETS
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MultiQC — always generated for every workflow
+# ─────────────────────────────────────────────────────────────────────────────
+rule multiqc:
+    input:
+        expand(f"{RESULTS_DIR}/{{sample}}/fastp/{{sample}}_fastp.json", sample=SAMPLES),
+    output: f"{OUTPUT_DIR}/multiqc/multiqc_report.html"
+    params:
+        results = RESULTS_DIR,
+        outdir  = f"{OUTPUT_DIR}/multiqc",
+    conda: "envs/report.yaml"
+    shell:
+        r"""
+        multiqc {params.results} \
+            -o {params.outdir} \
+            -n multiqc_report \
+            --force -q
+        """
+
+# ═════════════════════════════════════════════════════════════════════════════
+# METAGENOME REPORT RULES
+# ═════════════════════════════════════════════════════════════════════════════
+if WORKFLOW == "metagenome":
+
+    rule metagenome_mag_summary:
+        input:
+            checkm2 = expand(f"{RESULTS_DIR}/{{sample}}/checkm2/quality_report.tsv",
+                             sample=SAMPLES),
+            gtdbtk  = expand(f"{RESULTS_DIR}/{{sample}}/gtdbtk/gtdbtk.bac120.summary.tsv",
+                             sample=SAMPLES),
+        output: f"{OUTPUT_DIR}/tables/mag_summary.tsv"
+        params:
+            results_dir = RESULTS_DIR,
+            samples     = SAMPLES,
+        conda: "envs/report.yaml"
+        script: "scripts/metagenome_mag_summary.py"
+
+    rule metagenome_taxonomy_table:
+        input:
+            bracken = expand(f"{RESULTS_DIR}/{{sample}}/bracken/{{sample}}.S.bracken",
+                             sample=SAMPLES),
+        output: f"{OUTPUT_DIR}/tables/taxonomy_species.tsv"
+        params:
+            samples = SAMPLES,
+            results_dir = RESULTS_DIR,
+        conda: "envs/report.yaml"
+        script: "scripts/metagenome_taxonomy_table.py"
+
+    rule metagenome_mag_quality_plot:
+        input:  f"{OUTPUT_DIR}/tables/mag_summary.tsv"
+        output: f"{OUTPUT_DIR}/figures/mag_quality_scatter.png"
+        conda:  "envs/report.yaml"
+        script: "scripts/metagenome_mag_quality_plot.py"
+
+    rule metagenome_taxonomy_plot:
+        input:  f"{OUTPUT_DIR}/tables/taxonomy_species.tsv"
+        output: f"{OUTPUT_DIR}/figures/taxonomy_barplot.png"
+        params: top_n = config.get("taxonomy_top_n", 15)
+        conda:  "envs/report.yaml"
+        script: "scripts/metagenome_taxonomy_plot.py"
+
+    rule metagenome_html_report:
+        input:
+            multiqc     = f"{OUTPUT_DIR}/multiqc/multiqc_report.html",
+            mag_summary = f"{OUTPUT_DIR}/tables/mag_summary.tsv",
+            taxonomy    = f"{OUTPUT_DIR}/tables/taxonomy_species.tsv",
+            scatter     = f"{OUTPUT_DIR}/figures/mag_quality_scatter.png",
+            barplot     = f"{OUTPUT_DIR}/figures/taxonomy_barplot.png",
+        output: f"{OUTPUT_DIR}/metagenome_report.html"
+        params:
+            project = PROJECT,
+            samples = SAMPLES,
+        conda: "envs/report.yaml"
+        script: "scripts/render_html_report.py"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# WGS_SNP REPORT RULES
+# ═════════════════════════════════════════════════════════════════════════════
+elif WORKFLOW == "wgs_snp":
+
+    rule wgs_snp_variant_summary:
+        input:
+            stats = f"{RESULTS_DIR}/variant_stats.txt",
+            snpeff = f"{RESULTS_DIR}/snpeff_summary.html",
+        output: f"{OUTPUT_DIR}/tables/variant_summary.tsv"
+        params: results_dir = RESULTS_DIR
+        conda:  "envs/report.yaml"
+        script: "scripts/wgs_snp_variant_summary.py"
+
+    rule wgs_snp_titv_plot:
+        input:  f"{OUTPUT_DIR}/tables/variant_summary.tsv"
+        output: f"{OUTPUT_DIR}/figures/snp_titv.png"
+        conda:  "envs/report.yaml"
+        script: "scripts/wgs_snp_titv_plot.py"
+
+    rule wgs_snp_html_report:
+        input:
+            multiqc  = f"{OUTPUT_DIR}/multiqc/multiqc_report.html",
+            variants = f"{OUTPUT_DIR}/tables/variant_summary.tsv",
+            titv     = f"{OUTPUT_DIR}/figures/snp_titv.png",
+        output: f"{OUTPUT_DIR}/wgs_snp_report.html"
+        params:
+            project = PROJECT,
+            samples = SAMPLES,
+        conda: "envs/report.yaml"
+        script: "scripts/render_html_report.py"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# RNASEQ REPORT RULES
+# ═════════════════════════════════════════════════════════════════════════════
+elif WORKFLOW == "rnaseq":
+
+    rule rnaseq_de_summary:
+        input:  f"{RESULTS_DIR}/deseq2/all_results.tsv"
+        output: f"{OUTPUT_DIR}/tables/de_summary.tsv"
+        params: results_dir = RESULTS_DIR
+        conda:  "envs/report.yaml"
+        script: "scripts/rnaseq_de_summary.py"
+
+    rule rnaseq_pca_plot:
+        input:  f"{RESULTS_DIR}/deseq2/vst_counts.tsv"
+        output: f"{OUTPUT_DIR}/figures/pca.png"
+        conda:  "envs/report.yaml"
+        script: "scripts/rnaseq_pca_plot.py"
+
+    rule rnaseq_html_report:
+        input:
+            multiqc = f"{OUTPUT_DIR}/multiqc/multiqc_report.html",
+            de_tbl  = f"{OUTPUT_DIR}/tables/de_summary.tsv",
+            pca     = f"{OUTPUT_DIR}/figures/pca.png",
+        output: f"{OUTPUT_DIR}/rnaseq_report.html"
+        params:
+            project = PROJECT,
+            samples = SAMPLES,
+        conda: "envs/report.yaml"
+        script: "scripts/render_html_report.py"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SCRNASEQ REPORT RULES
+# ═════════════════════════════════════════════════════════════════════════════
+elif WORKFLOW == "scrnaseq":
+
+    rule scrnaseq_cluster_summary:
+        input:  expand(f"{RESULTS_DIR}/{{sample}}/scanpy/cluster_markers.tsv",
+                       sample=SAMPLES)
+        output: f"{OUTPUT_DIR}/tables/cluster_summary.tsv"
+        params:
+            results_dir = RESULTS_DIR,
+            samples     = SAMPLES,
+        conda: "envs/report.yaml"
+        script: "scripts/scrnaseq_cluster_summary.py"
+
+    rule scrnaseq_umap_plot:
+        input:  expand(f"{RESULTS_DIR}/{{sample}}/scanpy/umap_leiden.png",
+                       sample=SAMPLES)
+        output: f"{OUTPUT_DIR}/figures/umap.png"
+        params:
+            results_dir = RESULTS_DIR,
+            samples     = SAMPLES,
+        conda: "envs/report.yaml"
+        script: "scripts/scrnaseq_umap_collage.py"
+
+    rule scrnaseq_html_report:
+        input:
+            multiqc  = f"{OUTPUT_DIR}/multiqc/multiqc_report.html",
+            clusters = f"{OUTPUT_DIR}/tables/cluster_summary.tsv",
+            umap     = f"{OUTPUT_DIR}/figures/umap.png",
+        output: f"{OUTPUT_DIR}/scrnaseq_report.html"
+        params:
+            project = PROJECT,
+            samples = SAMPLES,
+        conda: "envs/report.yaml"
+        script: "scripts/render_html_report.py"

@@ -90,6 +90,7 @@ def run_workflow(
         )
 
     pid_path.write_text(str(proc.pid))
+    (run_dir / "snakemake.pid").write_text(str(proc.pid))
     meta_path.write_text(json.dumps({
         "run_id":     run_id,
         "workflow":   workflow_name,

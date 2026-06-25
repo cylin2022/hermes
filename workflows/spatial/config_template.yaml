@@ -1,0 +1,54 @@
+# Spatial Transcriptomics Analysis Pipeline
+# Platforms: 10x Visium (primary) / Visium HD / Xenium
+# Steps: QC → Normalize → Cluster → SVG → Deconvolution → Spatial Stats
+
+# ── Input ─────────────────────────────────────────────────────────────────────
+# CSV with header: sample,data_dir,platform
+#   sample    : unique section name (no spaces)
+#   data_dir  : Space Ranger output directory (contains spatial/ + filtered_feature_bc_matrix/)
+#               or Xenium output directory
+#   platform  : visium | visium_hd | xenium
+samplesheet: "/path/to/samplesheet.csv"
+
+# ── Output ────────────────────────────────────────────────────────────────────
+outdir: "/path/to/output"
+
+# ── QC thresholds ─────────────────────────────────────────────────────────────
+min_counts:  500       # minimum UMI counts per spot (Visium: 500; Xenium: 100)
+min_genes:   200       # minimum genes per spot
+max_counts:  50000     # cap for outlier spots (doublets/artifacts)
+max_mt_pct:  25        # mitochondrial % threshold (higher than scRNA-seq is normal for tissue)
+mt_prefix:   "MT-"    # "MT-" human/mouse; "mt:" fly; "Mt" zebrafish
+
+# ── Normalization & clustering ────────────────────────────────────────────────
+n_hvg:       3000      # highly variable genes
+n_pcs:       30        # PCA components (spatial data needs fewer than scRNA-seq)
+resolution:  0.5       # Leiden clustering resolution (0.3–1.5)
+n_neighbors: 15        # k-NN graph neighbors
+
+# ── Spatial graph ─────────────────────────────────────────────────────────────
+# Squidpy spatial neighbor graph for Moran's I and neighborhood analysis
+spatial_n_neighbors: 6   # 6 = hex grid neighbors for Visium; 4 for square grid
+
+# ── Spatially variable genes (SVG) ───────────────────────────────────────────
+n_svg:       200       # top N SVGs to report by Moran's I score
+svg_n_jobs:  16        # parallel jobs for Moran's I (use threads value)
+
+# ── Cell type deconvolution (cell2location) ───────────────────────────────────
+run_deconvolution: false
+# Reference scRNA-seq AnnData (h5ad) with cell type labels
+# Must have .obs column matching deconv_celltype_col
+reference_h5ad: ""
+deconv_celltype_col: "celltype"    # .obs column name in reference
+n_cells_per_location: 5            # expected cells per Visium spot (~5 for tissue sections)
+detection_alpha: 20                # cell2location hyperparameter (20 = weakly informative)
+
+# ── Spatial statistics ────────────────────────────────────────────────────────
+run_nhood_enrichment: true         # Squidpy neighborhood enrichment (cluster co-localization)
+run_co_occurrence:    true         # Squidpy co-occurrence score
+run_ripley:           false        # Ripley's K/L/G statistics (slow for large datasets)
+co_occurrence_interval: 50         # distance bins for co-occurrence analysis
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+threads: 16
+mem_gb:  64

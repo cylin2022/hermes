@@ -1,0 +1,496 @@
+import sys
+"""
+Metagenome workflow — PacBio HiFi reads
+Modules:
+  A  Taxonomic profiling  — Kraken2 + Bracken + Krona
+  B  MAG reconstruction   — hifiasm-meta → MetaBAT2 + SemiBin2 → DAS_Tool → CheckM2 → GTDB-Tk
+  C  Functional annotation— Pyrodigal → DIAMOND nr + eggNOG-mapper + InterProScan
+  R  Report               — MultiQC + per-sample MAG summary + cross-sample TSV
+"""
+
+import pandas as pd
+from pathlib import Path
+
+configfile: "config.yaml"
+
+# ── Samples ───────────────────────────────────────────────────────────────────
+samples_df = pd.read_csv(config["samples"]).set_index("sample", drop=False)
+SAMPLES    = samples_df.index.tolist()
+
+# ── Module toggles ─────────────────────────────────────────────────────────────
+DO_TAXA = config["modules"]["taxonomic_profiling"]
+DO_MAG  = config["modules"]["mag_reconstruction"]
+DO_FUNC = config["modules"]["functional_annotation"] and DO_MAG
+
+BINNERS = config.get("binners", ["metabat2", "semibin2"])
+
+wildcard_constraints:
+    sample = r"[^/]+"
+
+# ── Helper functions ───────────────────────────────────────────────────────────
+def get_fastq(wildcards):
+    return samples_df.loc[wildcards.sample, "fastq"]
+
+def sample_has_host(sample):
+    val = samples_df.loc[sample, "host_genome"]
+    return pd.notna(val) and str(val).strip() not in ("", "nan", "none", "None")
+
+def get_host_genome(wildcards):
+    return samples_df.loc[wildcards.sample, "host_genome"]
+
+def get_clean_reads(wildcards):
+    if sample_has_host(wildcards.sample):
+        return f"results/{wildcards.sample}/host_removal/{wildcards.sample}.clean.fastq.gz"
+    return f"results/{wildcards.sample}/fastp/{wildcards.sample}.fastp.fastq.gz"
+
+def scaffold2bin_inputs(wildcards):
+    files = []
+    if "metabat2" in BINNERS:
+        files.append(f"results/{wildcards.sample}/binning/metabat2/scaffold2bin.tsv")
+    if "semibin2" in BINNERS:
+        files.append(f"results/{wildcards.sample}/binning/semibin2/scaffold2bin.tsv")
+    return files
+
+def das_tool_labels(wildcards):
+    return ",".join([b for b in ["metabat2", "semibin2"] if b in BINNERS])
+
+# ── Master target ──────────────────────────────────────────────────────────────
+# ── Preflight: resource check before any job starts ───────────────────────────
+onstart:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
+    from preflight import preflight
+    preflight(config, workflow_name="metagenome")
+
+
+rule all:
+    input:
+        expand("results/{sample}/fastp/{sample}_fastp.json", sample=SAMPLES),
+        *([expand("results/{sample}/bracken/{sample}.S.bracken", sample=SAMPLES),
+           expand("results/{sample}/krona/{sample}.html",        sample=SAMPLES)]
+          if DO_TAXA else []),
+        *([expand("results/{sample}/checkm2/quality_report.tsv",          sample=SAMPLES),
+           expand("results/{sample}/gtdbtk/gtdbtk.bac120.summary.tsv",   sample=SAMPLES)]
+          if DO_MAG else []),
+        *([expand("results/{sample}/functional/eggnog/{sample}.emapper.annotations",
+                  sample=SAMPLES)]
+          if DO_FUNC else []),
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QC
+# ─────────────────────────────────────────────────────────────────────────────
+rule fastp_hifi:
+    input:  get_fastq
+    output:
+        fq   = "results/{sample}/fastp/{sample}.fastp.fastq.gz",
+        json = "results/{sample}/fastp/{sample}_fastp.json",
+        html = "results/{sample}/fastp/{sample}_fastp.html",
+    threads: 8
+    resources: mem_mb = 16_000
+    conda:  "envs/qc.yaml"
+    log:    "results/{sample}/logs/fastp.log"
+    shell:
+        r"""
+        fastp \
+            -i {input} -o {output.fq} \
+            --json {output.json} --html {output.html} \
+            --disable_adapter_trimming \
+            --qualified_quality_phred 20 \
+            --length_required 1000 \
+            --disable_trim_poly_g \
+            --thread {threads} 2>{log}
+        """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Host removal (only for samples with host_genome set in samplesheet)
+# ─────────────────────────────────────────────────────────────────────────────
+rule host_removal:
+    input:
+        reads = "results/{sample}/fastp/{sample}.fastp.fastq.gz",
+        host  = get_host_genome,
+    output:
+        clean = "results/{sample}/host_removal/{sample}.clean.fastq.gz",
+        stats = "results/{sample}/host_removal/{sample}.stats.txt",
+    threads: config["threads"]
+    resources: mem_mb = 32_000
+    conda:  "envs/host_removal.yaml"
+    log:    "results/{sample}/logs/host_removal.log"
+    shell:
+        r"""
+        TOTAL=$(zcat {input.reads} | awk 'NR%4==1' | wc -l)
+        minimap2 -ax map-hifi -t {threads} {input.host} {input.reads} 2>{log} \
+          | samtools view -@ 4 -f 4 -F 256 -b \
+          | samtools fastq -@ 4 - \
+          | pigz -p 8 > {output.clean}
+        CLEAN=$(zcat {output.clean} | awk 'NR%4==1' | wc -l)
+        printf "Total\t%d\nClean\t%d\nHost_removed\t%d\n" \
+            $TOTAL $CLEAN $(($TOTAL - $CLEAN)) > {output.stats}
+        """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module A  Taxonomic profiling
+# ─────────────────────────────────────────────────────────────────────────────
+rule kraken2:
+    input:  get_clean_reads
+    output:
+        report = "results/{sample}/kraken2/{sample}.report",
+        out    = "results/{sample}/kraken2/{sample}.kraken2.gz",
+    params: db = config["kraken2_db"]
+    threads: config["threads"]
+    resources: mem_mb = 120_000
+    conda:  "envs/kraken.yaml"
+    log:    "results/{sample}/logs/kraken2.log"
+    shell:
+        r"""
+        kraken2 \
+            --db {params.db} \
+            --threads {threads} \
+            --report {output.report} \
+            --output - \
+            --use-names \
+            --confidence 0.1 \
+            {input} 2>{log} | gzip > {output.out}
+        """
+
+rule bracken:
+    input:  "results/{sample}/kraken2/{sample}.report"
+    output:
+        sp  = "results/{sample}/bracken/{sample}.S.bracken",
+        gen = "results/{sample}/bracken/{sample}.G.bracken",
+    params: db = config["kraken2_db"]
+    conda:  "envs/kraken.yaml"
+    log:    "results/{sample}/logs/bracken.log"
+    shell:
+        r"""
+        bracken -d {params.db} -i {input} -o {output.sp}  -l S -t 10 2>  {log}
+        bracken -d {params.db} -i {input} -o {output.gen} -l G -t 10 2>> {log}
+        """
+
+rule krona:
+    input:  "results/{sample}/kraken2/{sample}.report"
+    output: "results/{sample}/krona/{sample}.html"
+    conda:  "envs/kraken.yaml"
+    shell:  "ktImportTaxonomy -t 5 -m 3 -o {output} {input}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module B  Assembly
+# ─────────────────────────────────────────────────────────────────────────────
+rule hifiasm_meta:
+    input:  get_clean_reads
+    output: "results/{sample}/assembly/{sample}.p_ctg.fa"
+    params:
+        prefix  = "results/{sample}/assembly/{sample}",
+        min_len = config.get("min_contig_len", 2000),
+    threads: config["threads"]
+    resources: mem_mb = int(config["mem_gb"] * 800)
+    conda:  "envs/assembly.yaml"
+    log:    "results/{sample}/logs/hifiasm_meta.log"
+    shell:
+        r"""
+        hifiasm --meta -t {threads} -o {params.prefix} {input} 2>{log}
+
+        # GFA → FASTA with length filter
+        awk '/^S/{{print ">"$2"\n"$3}}' {params.prefix}.p_ctg.gfa \
+          | awk 'BEGIN{{RS=">"; FS="\n"}} NR>1 {{
+                seq=""; for(i=2;i<=NF;i++) seq=seq$i;
+                if(length(seq)>={params.min_len}) printf ">%s\n%s\n",$1,seq
+            }}' > {output}
+
+        echo "Contigs >= {params.min_len} bp: $(grep -c '^>' {output})" >> {log}
+        """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module B  Coverage for binning
+# ─────────────────────────────────────────────────────────────────────────────
+rule map_to_assembly:
+    input:
+        reads    = get_clean_reads,
+        assembly = "results/{sample}/assembly/{sample}.p_ctg.fa",
+    output: "results/{sample}/coverage/{sample}.sorted.bam"
+    threads: config["threads"]
+    resources: mem_mb = 32_000
+    conda:  "envs/host_removal.yaml"
+    log:    "results/{sample}/logs/map_to_assembly.log"
+    shell:
+        r"""
+        minimap2 -ax map-hifi -t {threads} {input.assembly} {input.reads} 2>{log} \
+          | samtools sort -@ 8 -o {output}
+        samtools index {output}
+        """
+
+rule jgi_depth:
+    input:  "results/{sample}/coverage/{sample}.sorted.bam"
+    output: "results/{sample}/coverage/{sample}.depth.txt"
+    conda:  "envs/binning.yaml"
+    log:    "results/{sample}/logs/jgi_depth.log"
+    shell:
+        "jgi_summarize_bam_contig_depths --outputDepth {output} {input} 2>{log}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module B  Binning
+# ─────────────────────────────────────────────────────────────────────────────
+rule metabat2:
+    input:
+        assembly = "results/{sample}/assembly/{sample}.p_ctg.fa",
+        depth    = "results/{sample}/coverage/{sample}.depth.txt",
+    output:  touch("results/{sample}/binning/metabat2/.done")
+    params:
+        outdir  = "results/{sample}/binning/metabat2",
+        min_len = config.get("min_contig_len", 2000),
+    threads: config["threads"]
+    resources: mem_mb = 32_000
+    conda:   "envs/binning.yaml"
+    log:     "results/{sample}/logs/metabat2.log"
+    shell:
+        r"""
+        mkdir -p {params.outdir}
+        metabat2 -i {input.assembly} -a {input.depth} \
+            -o {params.outdir}/bin -m {params.min_len} \
+            -t {threads} --minContigDepth 1 --seed 42 2>{log}
+        """
+
+rule semibin2:
+    input:
+        assembly = "results/{sample}/assembly/{sample}.p_ctg.fa",
+        bam      = "results/{sample}/coverage/{sample}.sorted.bam",
+    output:  touch("results/{sample}/binning/semibin2/.done")
+    params:
+        outdir = "results/{sample}/binning/semibin2",
+        env    = config.get("semibin2_environment", "global"),
+    threads: config["threads"]
+    resources: mem_mb = 64_000
+    conda:   "envs/binning.yaml"
+    log:     "results/{sample}/logs/semibin2.log"
+    shell:
+        r"""
+        SemiBin2 single_easy_bin \
+            -i {input.assembly} -b {input.bam} \
+            -o {params.outdir} \
+            --environment {params.env} \
+            -t {threads} 2>{log}
+        """
+
+rule make_scaffold2bin:
+    input:
+        mb2 = "results/{sample}/binning/metabat2/.done",
+        sb2 = "results/{sample}/binning/semibin2/.done",
+    output:
+        mb2 = "results/{sample}/binning/metabat2/scaffold2bin.tsv",
+        sb2 = "results/{sample}/binning/semibin2/scaffold2bin.tsv",
+    conda: "envs/binning.yaml"
+    shell:
+        r"""
+        Fasta_to_Scaffolds2Bin.sh \
+            -i results/{wildcards.sample}/binning/metabat2 -e fa \
+            > {output.mb2}
+        Fasta_to_Scaffolds2Bin.sh \
+            -i results/{wildcards.sample}/binning/semibin2/output_bins -e fa.gz \
+            > {output.sb2}
+        """
+
+rule das_tool:
+    input:
+        tsv   = scaffold2bin_inputs,
+        asm   = "results/{sample}/assembly/{sample}.p_ctg.fa",
+    output:
+        bins  = directory("results/{sample}/das_tool/{sample}_DASTool_bins"),
+        score = "results/{sample}/das_tool/{sample}_DASTool_summary.tsv",
+    params:
+        prefix  = "results/{sample}/das_tool/{sample}",
+        tsv_arg = lambda wc, input: ",".join(input.tsv),
+        labels  = das_tool_labels,
+    threads: config["threads"]
+    resources: mem_mb = 32_000
+    conda:   "envs/binning.yaml"
+    log:     "results/{sample}/logs/das_tool.log"
+    shell:
+        r"""
+        DAS_Tool \
+            -i {params.tsv_arg} \
+            -l {params.labels} \
+            -c {input.asm} \
+            -o {params.prefix} \
+            --threads {threads} \
+            --write_bins \
+            --search_engine diamond \
+            --score_threshold 0.5 2>{log}
+        """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module B  MAG quality assessment
+# ─────────────────────────────────────────────────────────────────────────────
+rule checkm2:
+    input:  "results/{sample}/das_tool/{sample}_DASTool_bins"
+    output: "results/{sample}/checkm2/quality_report.tsv"
+    params:
+        outdir = "results/{sample}/checkm2",
+        db     = config["checkm2_db"],
+    threads: config["threads"]
+    resources: mem_mb = 32_000
+    conda:   "envs/checkm2.yaml"
+    log:     "results/{sample}/logs/checkm2.log"
+    shell:
+        r"""
+        checkm2 predict \
+            --threads {threads} \
+            --input {input} \
+            --output-directory {params.outdir} \
+            --database_path {params.db}/uniref100.KO.1.dmnd \
+            --extension fa \
+            --force 2>{log}
+        """
+
+rule filter_hq_mags:
+    input:
+        qc   = "results/{sample}/checkm2/quality_report.tsv",
+        bins = "results/{sample}/das_tool/{sample}_DASTool_bins",
+    output: touch("results/{sample}/hq_mags/.done")
+    params:
+        outdir   = "results/{sample}/hq_mags",
+        min_comp = config["mag_quality"]["min_completeness"],
+        max_cont = config["mag_quality"]["max_contamination"],
+    conda: "envs/checkm2.yaml"
+    shell:
+        r"""
+        mkdir -p {params.outdir}
+        python3 -c "
+import pandas as pd, shutil, os, sys
+qc, bins_dir, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+min_c, max_co = float(sys.argv[4]), float(sys.argv[5])
+df = pd.read_csv(qc, sep='\t')
+hq = df[(df['Completeness'] >= min_c) & (df['Contamination'] <= max_co)]
+n = 0
+for _, row in hq.iterrows():
+    src = os.path.join(bins_dir, row['Name'] + '.fa')
+    if os.path.exists(src):
+        shutil.copy(src, out_dir)
+        n += 1
+print(f'HQ MAGs: {n}  (comp>={min_c}%, cont<={max_co}%)')
+" {input.qc} {input.bins} {params.outdir} {params.min_comp} {params.max_cont}
+        """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module B  MAG taxonomy (GTDB-Tk)
+# ─────────────────────────────────────────────────────────────────────────────
+rule gtdbtk:
+    input:  "results/{sample}/hq_mags/.done"
+    output: "results/{sample}/gtdbtk/gtdbtk.bac120.summary.tsv"
+    params:
+        mags_dir = "results/{sample}/hq_mags",
+        out_dir  = "results/{sample}/gtdbtk",
+        db       = config["gtdbtk_db"],
+    threads: config["threads"]
+    resources: mem_mb = 200_000
+    conda:   "envs/gtdbtk.yaml"
+    log:     "results/{sample}/logs/gtdbtk.log"
+    shell:
+        r"""
+        # Abort gracefully if no HQ MAGs were produced
+        n=$(ls {params.mags_dir}/*.fa 2>/dev/null | wc -l)
+        if [ "$n" -eq 0 ]; then
+            echo "No HQ MAGs found; writing empty summary." | tee {output}
+            exit 0
+        fi
+        export GTDBTK_DATA_PATH={params.db}
+        gtdbtk classify_wf \
+            --genome_dir {params.mags_dir} \
+            --out_dir {params.out_dir} \
+            --extension fa \
+            --cpus {threads} \
+            --skip_ani_screen \
+            --force 2>{log}
+        """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module C  Functional annotation
+# ─────────────────────────────────────────────────────────────────────────────
+rule pyrodigal:
+    input:  "results/{sample}/hq_mags/.done"
+    output:
+        faa = "results/{sample}/functional/genes/{sample}_proteins.faa",
+        fna = "results/{sample}/functional/genes/{sample}_genes.fna",
+        gff = "results/{sample}/functional/genes/{sample}_genes.gff",
+    params: mags_dir = "results/{sample}/hq_mags"
+    threads: config["threads"]
+    conda:  "envs/functional.yaml"
+    log:    "results/{sample}/logs/pyrodigal.log"
+    shell:
+        r"""
+        # Prefix each contig with its bin name to keep provenance
+        for f in {params.mags_dir}/*.fa; do
+            bin=$(basename "$f" .fa)
+            awk -v b="$bin" '/^>/{{print ">"b"_"substr($0,2)}} !/^>/{{print}}' "$f"
+        done > results/{wildcards.sample}/functional/genes/all_mags.fa
+
+        pyrodigal \
+            -i results/{wildcards.sample}/functional/genes/all_mags.fa \
+            -a {output.faa} -d {output.fna} -f gff \
+            -p meta -j {threads} \
+            > {output.gff} 2>{log}
+        """
+
+rule diamond_nr:
+    input:  "results/{sample}/functional/genes/{sample}_proteins.faa"
+    output: "results/{sample}/functional/diamond/{sample}_nr.tsv"
+    params: db = config["diamond_db"]
+    threads: config["threads"]
+    resources: mem_mb = 64_000
+    conda:  "envs/functional.yaml"
+    log:    "results/{sample}/logs/diamond_nr.log"
+    shell:
+        r"""
+        diamond blastp \
+            -q {input} -d {params.db} -o {output} \
+            --outfmt 6 qseqid sseqid pident length evalue bitscore staxids sscinames \
+            --threads {threads} \
+            --evalue 1e-5 \
+            --max-target-seqs 1 \
+            --more-sensitive \
+            --block-size 6 --index-chunks 1 2>{log}
+        """
+
+rule eggnog:
+    input:  "results/{sample}/functional/genes/{sample}_proteins.faa"
+    output: "results/{sample}/functional/eggnog/{sample}.emapper.annotations"
+    params:
+        out_dir = "results/{sample}/functional/eggnog",
+        db      = config["eggnog_db"],
+    threads: config["threads"]
+    resources: mem_mb = 32_000
+    conda:  "envs/functional.yaml"
+    log:    "results/{sample}/logs/eggnog.log"
+    shell:
+        r"""
+        emapper.py \
+            -i {input} --itype proteins \
+            --data_dir {params.db} \
+            -o {wildcards.sample} \
+            --output_dir {params.out_dir} \
+            --cpu {threads} \
+            -m diamond \
+            --tax_scope auto \
+            --override \
+            --no_file_comments 2>{log}
+        """
+
+rule interproscan:
+    input:  "results/{sample}/functional/genes/{sample}_proteins.faa"
+    output: "results/{sample}/functional/interpro/{sample}_interpro.tsv"
+    params: ipr = config["interproscan_dir"]
+    threads: config["threads"]
+    resources: mem_mb = 32_000
+    log:    "results/{sample}/logs/interproscan.log"
+    shell:
+        r"""
+        # InterProScan rejects stop-codon asterisks
+        sed 's/\*//g' {input} > {input}.tmp.faa
+        {params.ipr}/interproscan.sh \
+            -i {input}.tmp.faa \
+            -o {output} -f TSV \
+            -cpu {threads} \
+            --goterms --pathways \
+            --disable-precalc 2>{log}
+        rm {input}.tmp.faa
+        """
+
+# Report is handled by workflows/report/Snakefile (universal cross-workflow reporter)

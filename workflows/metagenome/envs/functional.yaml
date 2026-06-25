@@ -1,0 +1,9 @@
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - pyrodigal=3.5.2
+  - diamond=2.1.10
+  - eggnog-mapper=2.1.12
+  - pandas>=2.0

@@ -1,13 +1,27 @@
 # Genome Annotation Pipeline — Configuration
-# Steps: BUSCO → RepeatModeler → RepeatMasker → BRAKER4 → DIAMOND NR → InterProScan
+# Steps: BUSCO → RepeatModeler/EDTA → RepeatMasker → [IsoSeq mapping] → BRAKER3 → DIAMOND NR → InterProScan
 
 # ── Input ─────────────────────────────────────────────────────────────────────
 genome_fasta: "/path/to/assembly.fa"
 species_name: "my_species"          # no spaces; becomes RepeatModeler DB name
 
-# Optional hints for BRAKER4 (improves gene model quality substantially)
+# ── RNA evidence for BRAKER3 (strongly recommended) ───────────────────────────
+# ALWAYS provide RNA evidence when available — protein-only BRAKER3 misses
+# many genes and produces inaccurate exon-intron boundaries.
+#
+# Option A: IsoSeq HiFi (Kinnex / IsoSeq Express) — preferred
+#   Directory of *.hifi_reads.fastq.gz (one file per tissue/sample).
+#   Samples auto-discovered; mapped in parallel with minimap2 splice:hq,
+#   then merged into rna_mapping/merged_rna.bam → passed to BRAKER3 automatically.
+isoseq_dir: ""                      # e.g. "/data/project/isoseq/"
+isoseq_threads: 16                  # cores per sample (n_samples × 16 = total cores)
+
+# Option B: pre-existing sorted BAM (short-read RNA-seq or pre-mapped IsoSeq)
+#   Only used when isoseq_dir is blank.
 rnaseq_bam: ""                      # sorted BAM aligned to this genome
-protein_fasta: ""                   # related-species protein FASTA (e.g. RefSeq)
+
+# Protein homology (used together with RNA; always recommended)
+protein_fasta: ""                   # related-species protein FASTA (e.g. Metazoa.fa)
 
 # ── RepeatModeler: parallelization strategy ───────────────────────────────────
 # "standard"  : one RepeatModeler instance, N parallel RECON rounds via -pa
@@ -29,15 +43,32 @@ genome_split_n: 4                    # N parallel instances for "parallel" strat
 # Set to a previous RepeatModeler working directory to resume an interrupted run
 recover_dir: ""
 
-# ── EDTA: structural repeat annotation (optional, runs alongside RepeatModeler) ─
-# EDTA detects LTR, TIR, Helitron via structural features rather than all-vs-all
-# BLAST; ~5–10× faster than RepeatModeler for those element classes.
-# The EDTA + RepeatModeler combined library is used if use_edta: true.
-use_edta: false
+# ── TE annotation tool selection ─────────────────────────────────────────────
+# repeat_tool controls which tool(s) build the repeat library:
+#
+#   "repeatmodeler" (default)
+#       RepeatModeler only. All-vs-all BLAST; finds all TE classes including SINEs.
+#       Runtime: ~50–100 h for a 1 Gb genome.
+#
+#   "edta"
+#       EDTA only. Structural detection (TSD, LTR, TIR, Helitron).
+#       No BLAST; ~5–15 h for a 1 Gb genome. GPU cannot accelerate RepeatModeler,
+#       so EDTA is the fastest option on any hardware.
+#       Limitation: weaker SINE/small repeat detection vs RepeatModeler.
+#
+#   "both"
+#       Run EDTA + RepeatModeler in parallel, merge with CD-HIT-EST at 80% identity.
+#       Best sensitivity; runtime dominated by RepeatModeler (~50–100 h).
+#
+repeat_tool: "repeatmodeler"
 
 # ── BUSCO ─────────────────────────────────────────────────────────────────────
 run_busco: true
-busco_lineage: "vertebrata_odb10"    # actinopterygii_odb10 for fish; embryophyta_odb10 for plants
+busco_lineage: "vertebrata_odb10"    # odb10 datasets → BUSCO v5 (envs/busco.yaml = busco=5.x)
+                                     # odb12 datasets → BUSCO v6 (envs/busco.yaml = busco=6.0.0)
+                                     # fish: actinopterygii_odb10 / actinopterygii_odb12
+                                     # mollusks: mollusca_odb10 / mollusca_odb12
+                                     # plants: embryophyta_odb10 / embryophyta_odb12
 
 # ── Databases (server paths) ──────────────────────────────────────────────────
 nr_diamond_db: "/home/cylin/Vet_Hamaguri/databases/nr.dmnd"
@@ -45,8 +76,16 @@ eggnog_data_dir: "/home/cylin/Vet_Hamaguri/databases/eggnog_data"
 interproscan_dir: "/home/cylin/Vet_Hamaguri/databases/interproscan-5.73-104.0"
 
 # ── Resources ─────────────────────────────────────────────────────────────────
-threads: 64
+threads: 64       # BRAKER3 threads (GeneMark caps effective parallelism at ~48 internally)
 mem_gb: 256
+
+# Per-tool thread overrides for downstream parallel execution.
+# Set busco_threads + diamond_threads + ipr_threads = total available cores so that
+# all three rules run simultaneously after BRAKER3 completes.
+# Example (160-core machine): 40 + 80 + 40 = 160
+busco_threads:    40   # HMMER-based; diminishing returns past ~64
+diamond_threads:  80   # excellent linear scaling
+ipr_threads:      40   # Java workers; ~40 saturates most analyses
 
 # ── Output ────────────────────────────────────────────────────────────────────
 outdir: "/path/to/output"

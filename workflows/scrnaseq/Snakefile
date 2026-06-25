@@ -1,3 +1,4 @@
+import sys
 """
 scRNA-seq analysis pipeline
 Steps: FastQC → STARsolo → scDblFinder → Scanpy (QC/norm/cluster/markers)
@@ -55,6 +56,14 @@ wildcard_constraints:
     sample = "|".join(SAMPLES),
 
 # ── Target rule ───────────────────────────────────────────────────────────────
+# ── Preflight: resource check before any job starts ───────────────────────────
+onstart:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
+    from preflight import preflight
+    preflight(config, workflow_name="scrnaseq")
+
+
 rule all:
     input:
         str(OUTDIR / "multiqc" / "multiqc_report.html"),

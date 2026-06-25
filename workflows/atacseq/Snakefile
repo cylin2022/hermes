@@ -1,3 +1,4 @@
+import sys
 """
 ATAC-seq pipeline: open chromatin peak calling + differential accessibility
 FastQC → fastp → Bowtie2 → samtools markdup → MACS3 → DiffBind
@@ -36,6 +37,14 @@ CONTRASTS = [f"{c[0]}_vs_{c[1]}" for c in COMPARISONS]
 BT2_INDEX = str(OUTDIR / "bowtie2_index" / "genome")
 
 # ── Target rule ───────────────────────────────────────────────────────────────
+# ── Preflight: resource check before any job starts ───────────────────────────
+onstart:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
+    from preflight import preflight
+    preflight(config, workflow_name="atacseq")
+
+
 rule all:
     input:
         str(OUTDIR / "multiqc" / "multiqc_report.html"),

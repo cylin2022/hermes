@@ -1,0 +1,22 @@
+# ── Universal Report Workflow Config ─────────────────────────────────────────
+# Usage:
+#   snakemake -s /home/cylin/hermes/workflows/report/Snakefile \
+#       --use-conda --configfile report_config.yaml --cores 8
+
+# Which analysis workflow produced the results
+workflow_type: metagenome    # metagenome | wgs_snp | rnaseq | scrnaseq
+
+# Where the analysis results live (the 'results/' directory of the analysis run)
+results_dir: "results"
+
+# Where to write the report
+output_dir:  "report"
+
+# Project metadata (appears in the HTML report header)
+project_name: "Metagenome Analysis"
+
+# Same samplesheet used for the analysis
+samples: "samples.csv"
+
+# Workflow-specific options
+taxonomy_top_n: 15    # Top N species shown in taxonomy barplot (metagenome)

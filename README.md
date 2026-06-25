@@ -16,6 +16,7 @@ Hermes provides a set of Snakemake workflows orchestrated via an MCP server, all
 | `scrnaseq` | Single-cell RNA-seq clustering + markers | STARsolo, scDblFinder, Scanpy, Leiden |
 | `wgs_snp` | WGS SNP/INDEL calling (non-model organisms) | fastp, BWA-MEM2, DeepVariant (GPU), GLnexus, SNPeff |
 | `snp_association` | SNP-trait GWAS + Fst scan | PLINK2, GEMMA LMM, VCFtools Fst, CMplot |
+| `pool_seq` | Pool-seq allele frequency + Fst scan | fastp, BWA-MEM2, bcftools, Hudson Fst (R) |
 
 ## Input Format
 

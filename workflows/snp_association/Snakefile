@@ -1,3 +1,4 @@
+import sys
 """
 SNP-trait association analysis — binary phenotype, related individuals
 Designed for: 60 tilapia WGS samples (30 salt-tolerant vs 30 intolerant)
@@ -58,6 +59,14 @@ THREADS      = int(config.get("threads", 16))
 PFX          = str(OUTDIR / "plink" / "tilapia")
 
 # ── Target rule ───────────────────────────────────────────────────────────────
+# ── Preflight: resource check before any job starts ───────────────────────────
+onstart:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
+    from preflight import preflight
+    preflight(config, workflow_name="snp_association")
+
+
 rule all:
     input:
         str(OUTDIR / "pca" / "pca.eigenvec"),

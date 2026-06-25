@@ -1,11 +1,24 @@
 """
 Genome Annotation Pipeline
-BUSCO → RepeatModeler → RepeatMasker → BRAKER4 → DIAMOND NR → InterProScan
+BUSCO → RepeatModeler/EDTA → RepeatMasker → [IsoSeq mapping] → BRAKER3 → DIAMOND NR → InterProScan
 
-RepeatModeler is the dominant runtime (~50–100 h for a 1 GB genome).
-Two parallelization strategies are available; see config repeat_strategy.
+Notes:
+- BRAKER3 runs via Docker (teambraker/braker3:latest); conda env is NOT used.
+  braker4-allinone:latest is missing Scalar::Util::Numeric and cannot be used.
+- RepeatModeler scales as O(n²) with genome size; for genomes >1.5 GB use
+  repeat_tool: "edta" (structural detection, ~24-48 h vs weeks for RepeatModeler).
+- BRAKER3 workingdir must be chmod 777 before docker run (container runs as root).
+- BRAKER3 writes augustus.hints.aa; braker.aa symlink may not exist → handled below.
+- IsoSeq: set isoseq_dir to a directory of *.hifi_reads.fastq.gz files.
+  Samples are auto-discovered; each is mapped with minimap2 splice:hq and merged
+  into rna_mapping/merged_rna.bam, which is automatically passed to BRAKER3.
+  isoseq_threads (default 16) × number of samples = total cores used during mapping.
+  ALWAYS provide isoseq_dir (or rnaseq_bam) when RNA evidence is available —
+  protein-only BRAKER3 produces noticeably lower-quality gene models.
 """
 
+import glob
+import sys
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -13,14 +26,33 @@ GENOME_FA       = config["genome_fasta"]
 SPECIES_NAME    = config["species_name"]
 OUTDIR          = Path(config["outdir"])
 
-RNASEQ_BAM      = config.get("rnaseq_bam", "")
 PROTEIN_FA      = config.get("protein_fasta", "")
+
+# IsoSeq: auto-discover samples from isoseq_dir; overrides rnaseq_bam if set
+ISOSEQ_DIR      = config.get("isoseq_dir", "")
+ISOSEQ_THREADS  = int(config.get("isoseq_threads", 16))  # per sample
+
+if ISOSEQ_DIR:
+    _fastqs        = sorted(glob.glob(f"{ISOSEQ_DIR}/*.hifi_reads.fastq.gz"))
+    ISOSEQ_SAMPLES = [Path(f).name.replace(".hifi_reads.fastq.gz", "") for f in _fastqs]
+    if not ISOSEQ_SAMPLES:
+        raise ValueError(f"isoseq_dir={ISOSEQ_DIR} contains no *.hifi_reads.fastq.gz files")
+    RNASEQ_BAM = str(OUTDIR / "rna_mapping" / "merged_rna.bam")
+else:
+    ISOSEQ_SAMPLES = []
+    RNASEQ_BAM     = config.get("rnaseq_bam", "")
 
 REPEAT_STRATEGY = config.get("repeat_strategy", "standard")
 RM_PA           = int(config.get("repeatmodeler_pa", 4))
 GENOME_SPLIT_N  = int(config.get("genome_split_n", 4))
 RECOVER_DIR     = config.get("recover_dir", "")
-USE_EDTA        = str(config.get("use_edta", "false")).lower() == "true"
+
+# repeat_tool controls which TE annotation tools run:
+#   "repeatmodeler" (default) — RepeatModeler only, ~50-100h for 1 Gb genome
+#   "edta"                    — EDTA only, ~5-15h; faster but misses some SINE/small repeats
+#   "both"                    — run both and merge libraries; best sensitivity, slowest
+REPEAT_TOOL = config.get("repeat_tool", "repeatmodeler")
+USE_EDTA    = REPEAT_TOOL in ("edta", "both")
 
 RUN_BUSCO       = str(config.get("run_busco", "true")).lower() == "true"
 BUSCO_LINEAGE   = config.get("busco_lineage", "vertebrata_odb10")
@@ -32,19 +64,43 @@ INTERPROSCAN    = config.get("interproscan_dir", "/home/cylin/Vet_Hamaguri/datab
 THREADS         = int(config.get("threads", 64))
 MEM_GB          = int(config.get("mem_gb", 256))
 
+# Per-tool thread overrides — allows parallel execution of downstream rules.
+# When busco_threads + diamond_threads + ipr_threads == total cores, all three
+# run simultaneously after BRAKER3 completes (e.g. 40+80+40 = 160 cores).
+BUSCO_THREADS   = int(config.get("busco_threads",   40))
+DIAMOND_THREADS = int(config.get("diamond_threads", 80))
+IPR_THREADS     = int(config.get("ipr_threads",     40))
+
 RM_DB_PREFIX    = str(OUTDIR / "repeats" / "rmdb" / SPECIES_NAME)
 CHUNKS          = [f"{i:03d}" for i in range(GENOME_SPLIT_N)]
 RM_CHUNK_THREADS = max(4, THREADS // GENOME_SPLIT_N)
+
+# Compute the canonical repeat library path based on repeat_tool mode
+if REPEAT_TOOL == "edta":
+    FINAL_REPEAT_LIB = str(OUTDIR / "repeats" / "edta" / f"{Path(GENOME_FA).name}.mod.EDTA.final" / f"{Path(GENOME_FA).name}.mod.EDTA.TElib.fa")
+elif REPEAT_TOOL == "both":
+    FINAL_REPEAT_LIB = str(OUTDIR / "repeats" / f"{SPECIES_NAME}-combined.fa")
+else:
+    FINAL_REPEAT_LIB = str(OUTDIR / "repeats" / f"{SPECIES_NAME}-families.fa")
+
+# ── Preflight: resource check before any job starts ───────────────────────────
+onstart:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
+    from preflight import preflight
+    preflight(config, workflow_name="genome_annotation", needs_docker=True)
+
 
 # ── Target rule ───────────────────────────────────────────────────────────────
 rule all:
     input:
         str(OUTDIR / "busco" / "short_summary.txt") if RUN_BUSCO else [],
-        str(OUTDIR / "repeats" / f"{SPECIES_NAME}-families.fa"),
+        FINAL_REPEAT_LIB,
         str(OUTDIR / "masked" / f"{SPECIES_NAME}.masked.fa"),
         str(OUTDIR / "braker4" / "braker.gtf"),
         str(OUTDIR / "annotation" / "diamond_nr.tsv"),
         str(OUTDIR / "annotation" / "interproscan.tsv"),
+        str(OUTDIR / "busco_proteins" / "short_summary.txt"),
 
 # ── BUSCO ─────────────────────────────────────────────────────────────────────
 if RUN_BUSCO:
@@ -69,18 +125,14 @@ if RUN_BUSCO:
                   -m genome \
                   --cpu {threads} \
                   --force
-            cp {params.outdir}/busco_run/short_summary*.txt {output.summary}
+            # BUSCO 5+ writes short_summary.specific.<lineage>.<name>.txt
+            # Use find to locate it robustly rather than relying on glob expansion
+            found=$(find {params.outdir}/busco_run -name "short_summary*.txt" | head -1)
+            test -n "$found" || {{ echo "ERROR: BUSCO short_summary not found" >&2; exit 1; }}
+            cp "$found" {output.summary}
             """
 
-# ══════════════════════════════════════════════════════════════════════════════
-# RepeatModeler — Strategy: standard
-#
-# One RepeatModeler instance with -pa {RM_PA}.
-# -pa controls how many RECON clustering rounds run in parallel; each round
-# spawns rmblastn with threads/pa cores. Default pa=4 gives 4× more throughput
-# than the single-threaded default but does not reduce the n² BLAST call count.
-# ══════════════════════════════════════════════════════════════════════════════
-if REPEAT_STRATEGY == "standard":
+if REPEAT_TOOL != "edta" and REPEAT_STRATEGY == "standard":
     rule repeatmodeler_db:
         input:
             genome = GENOME_FA,
@@ -135,7 +187,7 @@ if REPEAT_STRATEGY == "standard":
 # fragmented (~5% of families for a well-balanced split). The CD-HIT-EST
 # merge step at 80% identity recovers most cross-chunk redundancy.
 # ══════════════════════════════════════════════════════════════════════════════
-else:
+if REPEAT_TOOL != "edta" and REPEAT_STRATEGY != "standard":
     rule split_genome:
         input:
             genome = GENOME_FA,
@@ -235,16 +287,16 @@ else:
             rm -f {params.raw}
             """
 
-# ── EDTA: structural TE annotation (optional, adds to RM library) ─────────────
-# EDTA uses structural features (TSD, LTR length, TIR palindrome) rather than
-# all-vs-all BLAST. 5–10× faster than RepeatModeler for LTR/TIR/Helitron classes.
-# The combined RM + EDTA library gives better sensitivity than either alone.
+# ── EDTA: structural TE annotation ────────────────────────────────────────────
+# repeat_tool: edta   → EDTA only (~5-15h); skips RepeatModeler entirely
+# repeat_tool: both   → run both and merge; best sensitivity
+# Uses structural features (TSD, LTR length, TIR palindrome), not all-vs-all BLAST.
 if USE_EDTA:
     rule edta:
         input:
             genome = GENOME_FA,
         output:
-            lib = str(OUTDIR / "repeats" / "edta" / f"{Path(GENOME_FA).name}.mod.EDTA.TElib.fa"),
+            lib = str(OUTDIR / "repeats" / "edta" / f"{Path(GENOME_FA).name}.mod.EDTA.final" / f"{Path(GENOME_FA).name}.mod.EDTA.TElib.fa"),
         params:
             outdir = str(OUTDIR / "repeats" / "edta"),
             genome = GENOME_FA,
@@ -254,6 +306,7 @@ if USE_EDTA:
         conda: "envs/edta.yaml"
         shell:
             """
+            mkdir -p {params.outdir}
             cd {params.outdir}
             EDTA.pl \
                 --genome {params.genome} \
@@ -261,30 +314,31 @@ if USE_EDTA:
                 --step all \
                 --threads {threads} \
                 --force 1
+            test -s {output.lib} || {{ echo "ERROR: EDTA TElib missing or empty" >&2; exit 1; }}
             """
 
     rule merge_rm_edta:
         input:
             rm_lib   = str(OUTDIR / "repeats" / f"{SPECIES_NAME}-families.fa"),
-            edta_lib = str(OUTDIR / "repeats" / "edta" / f"{Path(GENOME_FA).name}.mod.EDTA.TElib.fa"),
+            edta_lib = str(OUTDIR / "repeats" / "edta" / f"{Path(GENOME_FA).name}.mod.EDTA.final" / f"{Path(GENOME_FA).name}.mod.EDTA.TElib.fa"),
         output:
             lib = str(OUTDIR / "repeats" / f"{SPECIES_NAME}-combined.fa"),
+        params:
+            raw = str(OUTDIR / "repeats" / "combined_raw.fa"),
         threads: min(THREADS, 16)
         resources:
             mem_mb = 32 * 1024,
         conda: "envs/utils.yaml"
         shell:
             """
-            cat {input.rm_lib} {input.edta_lib} > combined_raw.fa
-            cd-hit-est -i combined_raw.fa -o {output.lib} \
+            cat {input.rm_lib} {input.edta_lib} > {params.raw}
+            cd-hit-est -i {params.raw} -o {output.lib} \
                 -c 0.80 -aS 0.80 -n 8 -T {threads} -M {resources.mem_mb} -d 0
-            rm -f combined_raw.fa
+            rm -f {params.raw}
             """
 
 def final_repeat_lib(wildcards):
-    if USE_EDTA:
-        return str(OUTDIR / "repeats" / f"{SPECIES_NAME}-combined.fa")
-    return str(OUTDIR / "repeats" / f"{SPECIES_NAME}-families.fa")
+    return FINAL_REPEAT_LIB
 
 # ── RepeatMasker: soft-mask ───────────────────────────────────────────────────
 rule repeatmasker:
@@ -315,7 +369,75 @@ rule repeatmasker:
         mv {params.outdir}/{params.gname}.out.gff {output.gff}   2>/dev/null || touch {output.gff}
         """
 
-# ── BRAKER4: gene prediction ──────────────────────────────────────────────────
+# ── IsoSeq HiFi mapping → BRAKER3 RNA hints ──────────────────────────────────
+# Activated when isoseq_dir is set in config.
+# Samples (*.hifi_reads.fastq.gz) are auto-discovered and mapped in parallel.
+# isoseq_threads (default 16) × n_samples cores are used simultaneously.
+# Output merged_rna.bam is passed automatically to BRAKER3 --bam flag.
+if ISOSEQ_SAMPLES:
+    rule isoseq_genome_index:
+        input:
+            genome = str(OUTDIR / "masked" / f"{SPECIES_NAME}.masked.fa"),
+        output:
+            mmi = str(OUTDIR / "rna_mapping" / "genome_splice.mmi"),
+        threads: 20
+        resources: mem_mb = 24 * 1024
+        conda: "envs/minimap2.yaml"
+        shell:
+            """
+            set -euo pipefail
+            mkdir -p $(dirname {output.mmi})
+            minimap2 -t {threads} -x splice:hq -uf -d {output.mmi} {input.genome}
+            test -s {output.mmi} || {{ echo "ERROR: genome index empty" >&2; exit 1; }}
+            """
+
+    rule isoseq_map:
+        input:
+            mmi   = str(OUTDIR / "rna_mapping" / "genome_splice.mmi"),
+            fastq = str(Path(ISOSEQ_DIR) / "{sample}.hifi_reads.fastq.gz"),
+        output:
+            bam = str(OUTDIR / "rna_mapping" / "{sample}.sort.bam"),
+            bai = str(OUTDIR / "rna_mapping" / "{sample}.sort.bam.bai"),
+        threads: ISOSEQ_THREADS
+        resources: mem_mb = ISOSEQ_THREADS * 4 * 1024
+        conda: "envs/minimap2.yaml"
+        shell:
+            """
+            set -euo pipefail
+            minimap2 -ax splice:hq -uf --secondary=no -C5 \
+                -t {threads} {input.mmi} {input.fastq} \
+            | samtools sort -@ {threads} -m 4G \
+                -T {output.bam}_tmp -o {output.bam}
+            samtools index -@ 8 {output.bam}
+            test -s {output.bam} || {{ echo "ERROR: {wildcards.sample} BAM empty" >&2; exit 1; }}
+            """
+
+    rule isoseq_merge:
+        input:
+            bams = expand(
+                str(OUTDIR / "rna_mapping" / "{sample}.sort.bam"),
+                sample=ISOSEQ_SAMPLES,
+            ),
+        output:
+            bam = str(OUTDIR / "rna_mapping" / "merged_rna.bam"),
+            bai = str(OUTDIR / "rna_mapping" / "merged_rna.bam.bai"),
+        threads: 32
+        resources: mem_mb = 16 * 1024
+        conda: "envs/minimap2.yaml"
+        shell:
+            """
+            set -euo pipefail
+            samtools merge -f -@ {threads} {output.bam} {input.bams}
+            samtools index -@ 16 {output.bam}
+            samtools flagstat -@ 16 {output.bam}
+            test -s {output.bam} || {{ echo "ERROR: merged_rna.bam empty" >&2; exit 1; }}
+            """
+
+# ── BRAKER3: gene prediction ──────────────────────────────────────────────────
+# Uses teambraker/braker3:latest Docker (NOT braker4-allinone — missing Scalar::Util::Numeric).
+# Container runs as root; workingdir must be chmod 777 before docker run.
+# --user flag must NOT be used (breaks Perl module access inside container).
+# Output may be braker.aa OR augustus.hints.aa — both are handled below.
 rule braker4:
     input:
         genome   = str(OUTDIR / "masked" / f"{SPECIES_NAME}.masked.fa"),
@@ -325,42 +447,101 @@ rule braker4:
         gtf  = str(OUTDIR / "braker4" / "braker.gtf"),
         aa   = str(OUTDIR / "braker4" / "braker.aa"),
     params:
-        outdir    = str(OUTDIR / "braker4"),
-        species   = SPECIES_NAME,
-        rna_flag  = f"--bam={RNASEQ_BAM}"    if RNASEQ_BAM  else "",
-        prot_flag = f"--prot_seq={PROTEIN_FA}" if PROTEIN_FA else "",
+        outdir     = str(OUTDIR / "braker4"),
+        masked_dir = str(OUTDIR / "masked"),
+        species    = SPECIES_NAME,
+        prot_vol   = f"-v {Path(PROTEIN_FA).parent}:/proteins:ro" if PROTEIN_FA else "",
+        rna_vol    = f"-v {Path(RNASEQ_BAM).parent}:/bam:ro"      if RNASEQ_BAM else "",
+        rna_flag   = f"--bam=/bam/{Path(RNASEQ_BAM).name}"        if RNASEQ_BAM else "",
+        prot_flag  = f"--prot_seq=/proteins/{Path(PROTEIN_FA).name}" if PROTEIN_FA else "",
     threads: THREADS
     resources:
         mem_mb = MEM_GB * 1024,
-    conda: "envs/braker4.yaml"
     shell:
         """
-        braker.pl \
-            --genome={input.genome} \
-            --species={params.species} \
-            --workingdir={params.outdir} \
-            --cores={threads} \
-            --gff3 \
-            {params.rna_flag} \
-            {params.prot_flag}
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        chmod 777 {params.outdir}
+        # GeneMark-ETP requires BAM sequence names to match genome sequence names.
+        # minimap2 truncates headers at the first space (e.g. "CM135227.1"), but
+        # BRAKER3 replaces spaces with underscores ("CM135227.1_Meretrix_...").
+        # Fix: pre-strip headers to the first word before passing to BRAKER3.
+        sed 's/^\\(>[^ ]*\\) .*/\\1/' {input.genome} > {params.outdir}/genome_shortid.fa
+        chmod 666 {params.outdir}/genome_shortid.fa
+        docker run --rm \
+            -v {params.masked_dir}:/masked:ro \
+            {params.prot_vol} \
+            {params.rna_vol} \
+            -v {params.outdir}:/workingdir \
+            teambraker/braker3:latest \
+            braker.pl \
+                --genome=/workingdir/genome_shortid.fa \
+                --species={params.species} \
+                --workingdir=/workingdir \
+                --threads={threads} \
+                --softmasking \
+                --gff3 \
+                {params.rna_flag} \
+                {params.prot_flag}
+        # Fix root-owned files (busybox avoids sudo password requirement)
+        docker run --rm -v {params.outdir}:/workingdir busybox \
+            sh -c "chown -R $(id -u):$(id -g) /workingdir" 2>/dev/null || true
+        # BRAKER3 sometimes writes augustus.hints.aa instead of braker.aa
+        if [ ! -f {output.aa} ] && [ -f {params.outdir}/augustus.hints.aa ]; then
+            cp {params.outdir}/augustus.hints.aa {output.aa}
+        fi
+        test -s {output.gtf} || {{ echo "ERROR: braker.gtf missing or empty" >&2; exit 1; }}
+        test -s {output.aa}  || {{ echo "ERROR: braker.aa missing or empty"  >&2; exit 1; }}
         """
 
-# ── Protein extraction (AGAT) ─────────────────────────────────────────────────
+# ── Protein extraction ────────────────────────────────────────────────────────
+# Use braker.aa directly rather than AGAT re-extraction.
+# AGAT fails when braker.gtf uses underscore-joined chromosome IDs
+# (e.g. CM135227.1_Meretrix_...) that don't match the short FASTA IDs in
+# masked.fa (CM135227.1). BRAKER3 already writes complete protein sequences
+# to braker.aa; we only need to strip trailing stop-codon asterisks.
 rule extract_proteins:
     input:
-        genome = str(OUTDIR / "masked" / f"{SPECIES_NAME}.masked.fa"),
-        gtf    = str(OUTDIR / "braker4" / "braker.gtf"),
+        aa = str(OUTDIR / "braker4" / "braker.aa"),
     output:
-        prot   = str(OUTDIR / "annotation" / "predicted_proteins.fa"),
-    conda: "envs/annotation.yaml"
+        prot = str(OUTDIR / "annotation" / "predicted_proteins.fa"),
     shell:
         """
+        set -euo pipefail
         mkdir -p $(dirname {output.prot})
-        agat_sp_extract_sequences.pl \
-            --gff {input.gtf} \
-            --fasta {input.genome} \
-            --protein \
-            --output {output.prot}
+        sed 's/\\*//g' {input.aa} > {output.prot}
+        test -s {output.prot} || {{ echo "ERROR: predicted_proteins.fa missing or empty" >&2; exit 1; }}
+        """
+
+# ── BUSCO proteins: annotation completeness ───────────────────────────────────
+# Evaluates what fraction of conserved single-copy orthologs are present in
+# BRAKER3's predicted proteins. Complements genome-mode BUSCO (assembly QC).
+rule busco_proteins:
+    input:
+        prot = str(OUTDIR / "annotation" / "predicted_proteins.fa"),
+    output:
+        summary = str(OUTDIR / "busco_proteins" / "short_summary.txt"),
+    params:
+        lineage = BUSCO_LINEAGE,
+        outdir  = str(OUTDIR / "busco_proteins"),
+    threads: BUSCO_THREADS
+    resources:
+        mem_mb = 32 * 1024,
+    conda: "envs/busco.yaml"
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        busco -i {input.prot} \
+              -l {params.lineage} \
+              -o busco_prot_run \
+              --out_path {params.outdir} \
+              -m protein \
+              --cpu {threads} \
+              --force
+        found=$(find {params.outdir}/busco_prot_run -name "short_summary*.txt" | head -1)
+        test -n "$found" || {{ echo "ERROR: BUSCO protein short_summary not found" >&2; exit 1; }}
+        cp "$found" {output.summary}
         """
 
 # ── DIAMOND NR ────────────────────────────────────────────────────────────────
@@ -370,7 +551,7 @@ rule diamond_nr:
         db   = NR_DB,
     output:
         str(OUTDIR / "annotation" / "diamond_nr.tsv"),
-    threads: THREADS
+    threads: DIAMOND_THREADS
     resources:
         mem_mb = 128 * 1024,
     conda: "envs/annotation.yaml"
@@ -396,7 +577,7 @@ rule interproscan:
         tsv  = str(OUTDIR / "annotation" / "interproscan.tsv"),
     params:
         ipr  = INTERPROSCAN,
-    threads: THREADS
+    threads: IPR_THREADS
     resources:
         mem_mb = 128 * 1024,
     conda: "envs/annotation.yaml"
