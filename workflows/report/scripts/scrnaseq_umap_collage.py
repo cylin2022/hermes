@@ -1,40 +1,46 @@
-"""Tile per-sample UMAP PNGs into a single collage image."""
+"""Copy/convert the single merged UMAP PDF produced by scrnaseq scanpy_pipeline.
+
+The scrnaseq workflow produces scanpy/umap_clusters.pdf (a single merged file),
+not per-sample umap_leiden.png files. This script converts the first page of the
+PDF to a PNG for embedding in the HTML report.
+"""
 import os
-from pathlib import Path
+import shutil
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-import math
 
-results_dir = snakemake.params.results_dir
-samples     = snakemake.params.samples
-out_path    = snakemake.output[0]
+umap_pdf = snakemake.input[0]
+out_path = snakemake.output[0]
 
-img_paths = [
-    f"{results_dir}/{s}/scanpy/umap_leiden.png"
-    for s in samples
-    if os.path.exists(f"{results_dir}/{s}/scanpy/umap_leiden.png")
-]
-
-if not img_paths:
+if not os.path.exists(umap_pdf) or os.path.getsize(umap_pdf) == 0:
+    # Produce placeholder
     fig, ax = plt.subplots(figsize=(4, 3))
-    ax.text(0.5, 0.5, "No UMAP images found", ha="center", va="center", transform=ax.transAxes)
+    ax.text(0.5, 0.5, "UMAP not available", ha="center", va="center",
+            transform=ax.transAxes, fontsize=12)
+    ax.axis("off")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
+    print(f"UMAP plot: placeholder written (source not found: {umap_pdf})")
 else:
-    n = len(img_paths)
-    cols = min(n, 3)
-    rows = math.ceil(n / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 5, rows * 4.5))
-    axes = [axes] if n == 1 else axes.flat
-    for ax, p, s in zip(axes, img_paths, samples):
-        img = mpimg.imread(p)
-        ax.imshow(img)
-        ax.set_title(s, fontsize=9)
+    # Try PDF→PNG conversion via pypdf + matplotlib, fallback to placeholder
+    try:
+        from pdf2image import convert_from_path
+        images = convert_from_path(umap_pdf, dpi=150, first_page=1, last_page=1)
+        images[0].save(out_path)
+        print(f"UMAP plot: converted from {umap_pdf}")
+    except Exception as e:
+        # pdf2image not available or conversion failed — produce informative placeholder
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.text(0.5, 0.6, "UMAP clusters", ha="center", va="center",
+                transform=ax.transAxes, fontsize=14, fontweight="bold")
+        ax.text(0.5, 0.45,
+                f"Source: {os.path.basename(umap_pdf)}\n"
+                "(PDF→PNG conversion unavailable; install pdf2image + poppler)",
+                ha="center", va="center", transform=ax.transAxes, fontsize=9,
+                color="#555555")
         ax.axis("off")
-    for ax in list(axes)[n:]:
-        ax.axis("off")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close()
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"UMAP plot: placeholder written (pdf2image error: {e})")

@@ -67,8 +67,11 @@ rule fastqc:
     conda: "envs/qc.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p {params.outdir}
         fastqc -t {threads} -o {params.outdir} {input.r1} {input.r2}
+        test -s {output.z1} || {{ echo 'ERROR: FastQC zip R1 empty' >&2; exit 1; }}
+        test -s {output.z2} || {{ echo 'ERROR: FastQC zip R2 empty' >&2; exit 1; }}
         """
 
 rule fastp:
@@ -86,6 +89,7 @@ rule fastp:
     conda: "envs/qc.yaml"
     shell:
         """
+        set -euo pipefail
         fastp -i {input.r1} -I {input.r2} \
               -o {output.r1} -O {output.r2} \
               -h {output.html} -j {output.json} \
@@ -93,6 +97,8 @@ rule fastp:
               --detect_adapter_for_pe \
               --qualified_quality_phred 20 \
               --length_required 25
+        test -s {output.r1} || {{ echo 'ERROR: fastp R1 output empty' >&2; exit 1; }}
+        test -s {output.r2} || {{ echo 'ERROR: fastp R2 output empty' >&2; exit 1; }}
         """
 
 # ── Bowtie2 index ─────────────────────────────────────────────────────────────
@@ -109,6 +115,7 @@ rule bowtie2_index:
     conda: "envs/align.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p $(dirname {params.prefix})
         bowtie2-build --threads {threads} {input.genome} {params.prefix}
         """
@@ -129,6 +136,7 @@ rule bowtie2:
     conda: "envs/align.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p $(dirname {output.bam})
         bowtie2 -x {params.index} \
                 -1 {input.r1} -2 {input.r2} \
@@ -137,6 +145,7 @@ rule bowtie2:
                 --threads {threads} | \
         samtools view -bS -q 10 -F 1804 - | \
         samtools sort -@ {threads} -m 2G -o {output.bam}
+        test -s {output.bam} || {{ echo 'ERROR: bowtie2 BAM empty' >&2; exit 1; }}
         """
 
 # ── Mark duplicates ───────────────────────────────────────────────────────────
@@ -145,7 +154,9 @@ rule markdup:
         bam = str(OUTDIR / "aligned" / "{sample}.raw.bam"),
     output:
         bam  = str(OUTDIR / "aligned" / "{sample}.markdup.bam"),
-        bai  = str(OUTDIR / "aligned" / "{sample}.markdup.bam.bai"),
+        # samtools >= 1.12 on large/non-standard references writes CSI (.bam.csi)
+        # instead of BAI (.bam.bai); align.yaml pins samtools=1.20 so use .csi
+        bai  = str(OUTDIR / "aligned" / "{sample}.markdup.bam.csi"),
         stat = str(OUTDIR / "aligned" / "{sample}.markdup.flagstat"),
     threads: 8
     resources:
@@ -153,8 +164,11 @@ rule markdup:
     conda: "envs/align.yaml"
     shell:
         """
+        set -euo pipefail
         samtools markdup -@ {threads} --write-index {input.bam} {output.bam}
+        test -s {output.bam} || {{ echo 'ERROR: markdup BAM empty' >&2; exit 1; }}
         samtools flagstat -@ {threads} {output.bam} > {output.stat}
+        test -s {output.stat} || {{ echo 'ERROR: flagstat empty' >&2; exit 1; }}
         """
 
 # ── Optional: remove blacklist regions ───────────────────────────────────────
@@ -162,23 +176,38 @@ if BLACKLIST:
     rule blacklist_filter:
         input:
             bam  = str(OUTDIR / "aligned" / "{sample}.markdup.bam"),
-            bai  = str(OUTDIR / "aligned" / "{sample}.markdup.bam.bai"),
+            bai  = str(OUTDIR / "aligned" / "{sample}.markdup.bam.csi"),
             bl   = BLACKLIST,
         output:
             bam  = str(OUTDIR / "aligned" / "{sample}.filtered.bam"),
-            bai  = str(OUTDIR / "aligned" / "{sample}.filtered.bam.bai"),
+            bai  = str(OUTDIR / "aligned" / "{sample}.filtered.bam.csi"),
         threads: 8
         conda: "envs/align.yaml"
         shell:
             """
+            set -euo pipefail
             bedtools intersect -v -abam {input.bam} -b {input.bl} > {output.bam}
-            samtools index -@ {threads} {output.bam}
+            test -s {output.bam} || {{ echo 'ERROR: filtered BAM empty' >&2; exit 1; }}
+            samtools index -@ {threads} -c {output.bam}
+            test -s {output.bai} || {{ echo 'ERROR: filtered BAM index empty' >&2; exit 1; }}
             """
 
 def final_bam(wc):
     if BLACKLIST:
         return str(OUTDIR / "aligned" / f"{wc.sample}.filtered.bam")
     return str(OUTDIR / "aligned" / f"{wc.sample}.markdup.bam")
+
+def final_bam_list(_wc):
+    """Return per-sample BAM paths for DiffBind input (respects BLACKLIST)."""
+    if BLACKLIST:
+        return [str(OUTDIR / "aligned" / f"{s}.filtered.bam") for s in SAMPLES]
+    return [str(OUTDIR / "aligned" / f"{s}.markdup.bam") for s in SAMPLES]
+
+def final_bai_list(_wc):
+    """Return per-sample BAM index paths for DiffBind input (CSI, respects BLACKLIST)."""
+    if BLACKLIST:
+        return [str(OUTDIR / "aligned" / f"{s}.filtered.bam.csi") for s in SAMPLES]
+    return [str(OUTDIR / "aligned" / f"{s}.markdup.bam.csi") for s in SAMPLES]
 
 # ── MACS3 peak calling ────────────────────────────────────────────────────────
 # --nomodel --nolambda: ATAC signal is not ChIP-like; skip local lambda model
@@ -200,6 +229,7 @@ rule macs3:
     conda: "envs/macs3.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p {params.outdir}
         macs3 callpeak \
             -t {input.bam} \
@@ -211,6 +241,7 @@ rule macs3:
             --shift -75 --extsize 150 \
             --keep-dup all \
             -q 0.01
+        test -s {output.peak} || {{ echo 'ERROR: MACS3 narrowPeak empty' >&2; exit 1; }}
         """
 
 # ── MultiQC ───────────────────────────────────────────────────────────────────
@@ -223,20 +254,28 @@ rule multiqc:
         str(OUTDIR / "multiqc" / "multiqc_report.html"),
     conda: "envs/qc.yaml"
     shell:
-        "multiqc {OUTDIR}/fastqc/ {OUTDIR}/fastp/ {OUTDIR}/aligned/ "
-        "-o {OUTDIR}/multiqc/ --force"
+        """
+        set -euo pipefail
+        multiqc {OUTDIR}/fastqc/ {OUTDIR}/fastp/ {OUTDIR}/aligned/ \
+            -o {OUTDIR}/multiqc/ --force
+        test -s {output} || {{ echo 'ERROR: MultiQC report empty' >&2; exit 1; }}
+        """
 
 # ── DiffBind: differential accessibility ─────────────────────────────────────
 rule diffbind:
     input:
-        bams     = expand(str(OUTDIR / "aligned" / "{sample}.markdup.bam"),   sample=SAMPLES),
-        bais     = expand(str(OUTDIR / "aligned" / "{sample}.markdup.bam.bai"), sample=SAMPLES),
+        # Use lambda helpers so the correct BAM suffix is used when BLACKLIST is set
+        bams     = final_bam_list,
+        bais     = final_bai_list,
         peaks    = expand(str(OUTDIR / "peaks"   / "{sample}_peaks.narrowPeak"), sample=SAMPLES),
         metadata = SAMPLESHEET,
     output:
         results  = str(OUTDIR / "diffbind" / "{contrast}_results.tsv"),
         volcano  = str(OUTDIR / "diffbind" / "{contrast}_volcano.pdf"),
-        pca_plot = str(OUTDIR / "diffbind" / "pca.pdf"),
+        # pca_plot removed: "pca.pdf" is a fixed path but this rule has a {contrast}
+        # wildcard, so declaring it as output would cause a wildcard conflict
+        # (Snakemake would try to resolve {contrast} in a path that has none).
+        # The R script writes pca.pdf directly via file.path(outdir, "pca.pdf").
     params:
         contrast    = "{contrast}",
         comparisons = COMPARISONS,

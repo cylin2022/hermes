@@ -50,6 +50,18 @@ SVG_JOBS     = int(config.get("svg_n_jobs", THREADS))
 RUN_DECONV   = str(config.get("run_deconvolution", "false")).lower() == "true"
 REF_H5AD     = config.get("reference_h5ad", "")
 CELLTYPE_COL = config.get("deconv_celltype_col", "celltype")
+
+# Preflight guard: fail early if deconvolution requested but no reference provided
+if RUN_DECONV and not REF_H5AD:
+    raise ValueError(
+        "run_deconvolution is true but reference_h5ad is empty or not set in config. "
+        "Please set reference_h5ad to a valid scRNA-seq .h5ad file path."
+    )
+if RUN_DECONV and REF_H5AD and not Path(REF_H5AD).exists():
+    raise ValueError(
+        f"reference_h5ad path does not exist: {REF_H5AD!r}. "
+        "Please provide a valid path to the scRNA-seq reference h5ad file."
+    )
 N_CELLS_LOC  = int(config.get("n_cells_per_location", 5))
 DET_ALPHA    = float(config.get("detection_alpha", 20))
 

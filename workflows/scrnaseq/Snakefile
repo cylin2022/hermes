@@ -86,7 +86,29 @@ rule fastqc:
     threads: 4
     conda: "envs/qc.yaml"
     shell:
-        "fastqc -t {threads} -o $(dirname {output.h1}) {input.r1} {input.r2}"
+        """
+        set -euo pipefail
+        TMPDIR=$(mktemp -d)
+        fastqc -t {threads} -o "$TMPDIR" {input.r1} {input.r2}
+        # FastQC names outputs after the input filename, not the sample wildcard.
+        # Rename to the exact paths Snakemake declared.
+        r1_base=$(basename {input.r1})
+        r1_stem="${{r1_base%.gz}}"
+        r1_stem="${{r1_stem%.fastq}}"
+        r1_stem="${{r1_stem%.fq}}"
+        r2_base=$(basename {input.r2})
+        r2_stem="${{r2_base%.gz}}"
+        r2_stem="${{r2_stem%.fastq}}"
+        r2_stem="${{r2_stem%.fq}}"
+        mkdir -p $(dirname {output.h1})
+        mv "$TMPDIR/${{r1_stem}}_fastqc.html" {output.h1}
+        mv "$TMPDIR/${{r1_stem}}_fastqc.zip"  {output.z1}
+        mv "$TMPDIR/${{r2_stem}}_fastqc.html" {output.h2}
+        mv "$TMPDIR/${{r2_stem}}_fastqc.zip"  {output.z2}
+        rm -rf "$TMPDIR"
+        test -s {output.h1} || {{ echo 'ERROR: {output.h1} empty' >&2; exit 1; }}
+        test -s {output.h2} || {{ echo 'ERROR: {output.h2} empty' >&2; exit 1; }}
+        """
 
 rule multiqc:
     input:
@@ -96,7 +118,11 @@ rule multiqc:
         str(OUTDIR / "multiqc" / "multiqc_report.html"),
     conda: "envs/qc.yaml"
     shell:
-        "multiqc {OUTDIR}/fastqc/ {OUTDIR}/starsolo/ -o {OUTDIR}/multiqc/ --force"
+        """
+        set -euo pipefail
+        multiqc {OUTDIR}/fastqc/ {OUTDIR}/starsolo/ -o {OUTDIR}/multiqc/ --force
+        test -s {output} || {{ echo 'ERROR: multiqc_report.html empty' >&2; exit 1; }}
+        """
 
 # ── STAR genome index ─────────────────────────────────────────────────────────
 rule star_index:
@@ -113,6 +139,7 @@ rule star_index:
     conda: "envs/star.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p {output}
         STAR --runMode genomeGenerate \
              --genomeDir {output} \
@@ -120,6 +147,7 @@ rule star_index:
              --sjdbGTFfile {input.gtf} \
              --runThreadN {threads} \
              --genomeSAindexNbases {params.sa}
+        test -f {output}/SA || {{ echo 'ERROR: STAR index SA file missing' >&2; exit 1; }}
         """
 
 # ── STARsolo: alignment + barcode/UMI counting ────────────────────────────────
@@ -145,6 +173,7 @@ rule starsolo:
     conda: "envs/star.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p {params.outpfx}
         STAR --runThreadN {threads} \
              --genomeDir {input.index} \
@@ -158,6 +187,8 @@ rule starsolo:
              --soloFeatures Gene \
              --outFileNamePrefix {params.outpfx}
         samtools index {output.bam}
+        test -s {output.matrix} || {{ echo 'ERROR: matrix.mtx empty' >&2; exit 1; }}
+        test -s {output.log}    || {{ echo 'ERROR: Log.final.out empty' >&2; exit 1; }}
         """
 
 # ── Doublet detection: scDblFinder (R/Bioconductor) ──────────────────────────

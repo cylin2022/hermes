@@ -117,8 +117,9 @@ message("[plots] Drawing PCA plot")
 pca  <- fread(pca_file)
 setnames(pca, c("FID", "IID", paste0("PC", seq_len(ncol(pca) - 2))))
 
-pheno <- fread(pheno_file, header = FALSE, col.names = c("IID", "phenotype"))
-pca   <- merge(pca, pheno, by = "IID", all.x = TRUE)
+pheno <- fread(pheno_file, header = TRUE)
+setnames(pheno, old = c("IID", "PHENOTYPE"), new = c("IID", "phenotype"), skip_absent = TRUE)
+pca   <- merge(pca, pheno[, .(IID, phenotype)], by = "IID", all.x = TRUE)
 pca[, group := ifelse(phenotype == 1, "Salt-tolerant", "Salt-intolerant")]
 
 p <- ggplot(pca, aes(PC1, PC2, colour = group, label = IID)) +

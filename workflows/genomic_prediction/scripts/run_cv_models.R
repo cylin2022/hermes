@@ -43,10 +43,11 @@ for (j in seq_len(ncol(X))) {
   if (any(na_idx)) X[na_idx, j] <- mean(X[!na_idx, j])
 }
 
-pheno <- fread(pheno_file, header = FALSE, data.table = FALSE,
-               col.names = c("sample", "phenotype"))
+pheno <- fread(pheno_file, header = TRUE, data.table = FALSE)
+colnames(pheno)[1:2] <- c("sample", "phenotype")
 pheno <- pheno[match(sids, pheno$sample), ]
-stopifnot(!anyNA(pheno$sample))  # all VCF samples must be in phenotype file
+stopifnot(!anyNA(pheno$sample))      # all VCF samples must be in phenotype file
+stopifnot(!anyNA(pheno$phenotype))   # phenotype must be non-missing for all samples
 y     <- as.integer(pheno$phenotype)
 n     <- length(y)
 
@@ -159,8 +160,8 @@ for (fold in seq_len(n_folds)) {
   # ── 3. Random Forest ─────────────────────────────────────────────────────────
   message("  Running Random Forest...")
   tryCatch({
-    df_tr <- data.frame(y = factor(ytr, levels = c(0, 1)), Xtr)
-    df_te <- data.frame(Xte)
+    df_tr <- data.frame(y = factor(ytr, levels = c(0, 1)), Xtr_sc)
+    df_te <- data.frame(Xte_sc)
 
     fit_rf <- ranger(
       y ~ ., data = df_tr,
@@ -191,8 +192,8 @@ for (fold in seq_len(n_folds)) {
   # ── 4. XGBoost ───────────────────────────────────────────────────────────────
   message("  Running XGBoost...")
   tryCatch({
-    dtrain <- xgb.DMatrix(Xtr, label = ytr)
-    dtest  <- xgb.DMatrix(Xte)
+    dtrain <- xgb.DMatrix(Xtr_sc, label = ytr)
+    dtest  <- xgb.DMatrix(Xte_sc)
 
     params <- list(
       objective        = "binary:logistic",

@@ -5,6 +5,7 @@ channels:
   - defaults
 dependencies:
   - r-base=4.3
+  - bioconductor-dropletutils
   - bioconductor-scdblfinder
   - bioconductor-singlecellexperiment
   - bioconductor-biocparallel

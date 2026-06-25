@@ -96,10 +96,12 @@ if has_cov:
     cov_z   = (cov_arr - means) / stds
 
     # GEMMA covariate file: no header; first column = intercept (1)
+    # GEMMA does not accept "NA" in covariate files; impute missing with 0
+    # (z-scored values have mean=0, so 0 = mean imputation).
     Path(gemma_cov_out).parent.mkdir(parents=True, exist_ok=True)
     with open(gemma_cov_out, "w") as f:
         for row in cov_z:
-            vals = ["1"] + ["NA" if np.isnan(v) else f"{v:.6f}" for v in row]
+            vals = ["1"] + ["0.000000" if np.isnan(v) else f"{v:.6f}" for v in row]
             f.write("\t".join(vals) + "\n")
     print(f"[prepare] GEMMA covariates written ({len(cov_cols)} columns: {cov_cols})")
 

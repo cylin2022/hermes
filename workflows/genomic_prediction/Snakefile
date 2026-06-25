@@ -56,7 +56,7 @@ rule plink_qc:
     conda: "envs/genomic_ml.yaml"
     shell: """
         set -euo pipefail
-        mkdir -p {params.prefix%/*}
+        mkdir -p $(dirname {params.prefix})
         plink2 \
             --vcf {input.vcf} \
             --maf {params.maf} \

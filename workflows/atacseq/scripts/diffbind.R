@@ -25,11 +25,18 @@ cond2 <- parts[2]
 
 meta <- read.csv(meta_file, stringsAsFactors = FALSE)
 
+# Resolve the actual BAM paths from the Snakemake input list
+# (the Snakefile passes either .markdup.bam or .filtered.bam depending on BLACKLIST)
+bam_paths <- unlist(snakemake@input[["bams"]])
+bam_map   <- setNames(bam_paths, basename(bam_paths))
+bam_map   <- setNames(bam_paths,
+                      sub("\\.(markdup|filtered)\\.bam$", "", basename(bam_paths)))
+
 # Build DiffBind sample sheet
 db_sheet <- data.frame(
     SampleID  = meta$sample,
     Condition = meta$group,
-    bamReads  = file.path(bam_dir,  paste0(meta$sample, ".markdup.bam")),
+    bamReads  = bam_map[meta$sample],
     Peaks     = file.path(peak_dir, paste0(meta$sample, "_peaks.narrowPeak")),
     PeakCaller = "narrow",
     stringsAsFactors = FALSE

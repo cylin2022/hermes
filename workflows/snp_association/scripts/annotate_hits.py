@@ -95,8 +95,10 @@ closest_results = {}
 
 if annot_file and os.path.exists(annot_file):
     if annot_file.endswith(".gff") or annot_file.endswith(".gff3"):
-        awk = r"""awk '$3=="gene"{printf "%s\t%d\t%d\t%s\t.\t%s\n",$1,$4-1,$5,$9,$7}'"""
+        # GFF3: attributes use key=value; extract value after 'ID='
+        awk = r"""awk '$3=="gene"{id=$9; gsub(/.*ID=/,"",id); gsub(/;.*/,"",id); printf "%s\t%d\t%d\t%s\t.\t%s\n",$1,$4-1,$5,id,$7}'"""
     else:
+        # GTF: attributes use key "value"; pass full attribute field for parse_name
         awk = r"""awk '$3=="gene"{printf "%s\t%d\t%d\t%s\t.\t%s\n",$1,$4-1,$5,$9,$7}'"""
     os.system(f"grep -v '^#' {annot_file} | {awk} | sort -k1,1 -k2,2n > {gene_bed}")
 

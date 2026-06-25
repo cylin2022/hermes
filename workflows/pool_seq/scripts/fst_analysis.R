@@ -4,6 +4,7 @@ library(ggplot2)
 # ── parameters ────────────────────────────────────────────────────────────────
 samples    <- snakemake@params[["samples"]]
 pool_sizes <- setNames(as.integer(snakemake@params[["pool_sizes"]]), samples)
+ploidy     <- as.integer(snakemake@params[["ploidy"]])   # 2 for diploid
 comparison <- snakemake@params[["comparison"]]
 win_size   <- as.integer(snakemake@params[["window"]])
 step_size  <- as.integer(snakemake@params[["step"]])
@@ -13,8 +14,19 @@ max_cov    <- snakemake@params[["max_cov"]]
 pools_a   <- comparison$pools_a
 pools_b   <- comparison$pools_b
 comp_name <- comparison$name
-n_a       <- sum(pool_sizes[pools_a])   # total haploid alleles in group A
-n_b       <- sum(pool_sizes[pools_b])   # total haploid alleles in group B
+
+# Validate pool names against samplesheet
+missing <- setdiff(c(pools_a, pools_b), samples)
+if (length(missing) > 0)
+  stop(sprintf("[%s] Unknown pool names: %s. Available: %s",
+               comp_name, paste(missing, collapse = ", "), paste(samples, collapse = ", ")))
+
+# Haploid count = number of fish × ploidy (Hudson Fst requires haploid allele count)
+n_a <- sum(pool_sizes[pools_a]) * ploidy
+n_b <- sum(pool_sizes[pools_b]) * ploidy
+cat(sprintf("[%s] Group A: %s (n=%d haploid)  Group B: %s (n=%d haploid)\n",
+            comp_name, paste(pools_a, collapse="+"), n_a,
+            paste(pools_b, collapse="+"), n_b))
 
 # ── read AD table ─────────────────────────────────────────────────────────────
 # columns: chr pos ref alt  sample1_AD  sample2_AD ...
@@ -41,6 +53,10 @@ keep <- rowSums(dt[, ..depth_cols] >= min_cov) == length(samples) &
 dt   <- dt[keep]
 cat(sprintf("[%s] SNPs after coverage filter: %d\n", comp_name, nrow(dt)))
 
+if (nrow(dt) == 0)
+  stop(sprintf("[%s] No SNPs passed coverage filter (min_cov=%d, max_cov=%d). Check BAM coverage.",
+               comp_name, min_cov, max_cov))
+
 # ── group-level allele frequencies (weighted mean by pool size) ───────────────
 freq_a_cols <- paste0(pools_a, "_freq")
 freq_b_cols <- paste0(pools_b, "_freq")
@@ -52,6 +68,7 @@ dt[, p_b := as.vector(as.matrix(.SD) %*% w_b), .SDcols = freq_b_cols]
 
 # ── Hudson Fst (Bhatia et al. 2013) ──────────────────────────────────────────
 # Appropriate for Pool-seq: corrects for finite haploid pool size.
+# n_a / n_b = haploid chromosome count (pool_size * ploidy), NOT fish count.
 # Fst = [(p_a - p_b)^2 - p_a(1-p_a)/(n_a-1) - p_b(1-p_b)/(n_b-1)] /
 #       [p_a(1-p_b) + p_b(1-p_a)]
 dt[, fst := {
@@ -90,6 +107,9 @@ windows <- rbindlist(lapply(chrs, function(chr_id) {
   }))
 }))
 
+if (is.null(windows) || nrow(windows) == 0)
+  stop(sprintf("[%s] No sliding windows with >= 3 SNPs. Increase window_size or check coverage.", comp_name))
+
 fwrite(windows, snakemake@output[["windows"]], sep = "\t")
 
 # ── Manhattan plot ────────────────────────────────────────────────────────────
@@ -106,9 +126,8 @@ windows[, chr_idx := match(chr, chr_order)]
 
 fst_win_99  <- quantile(windows$fst_mean, 0.99, na.rm = TRUE)
 tick_pos    <- offsets[chr_lens$chr] + chr_lens$len / 2
-tick_labels <- sub("^(NC_[0-9]+\\.[0-9]+|LG|Chr|chr)", "\\1", chr_lens$chr)
-# Shorten NC_ accessions to last token for readability
-tick_labels <- sub("^NC_0+([0-9]+)\\.[0-9]+$", "\\1", tick_labels)
+# Shorten NC_ accessions to numeric part for readability
+tick_labels <- sub("^NC_0+([0-9]+)\\.[0-9]+$", "\\1", chr_lens$chr)
 
 p <- ggplot(windows, aes(x, fst_mean, color = factor(chr_idx %% 2))) +
   geom_point(size = 0.4, alpha = 0.7) +
@@ -144,6 +163,6 @@ p <- ggplot(windows, aes(x, fst_mean, color = factor(chr_idx %% 2))) +
   )
 
 ggsave(snakemake@output[["pdf"]], p,
-       width = 14, height = 5, useDingbats = FALSE)
+       width = 14, height = 5, device = grDevices::pdf)
 
 cat(sprintf("[%s] Done.\n", comp_name))

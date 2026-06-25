@@ -50,6 +50,28 @@ elif platform == "xenium":
     table_key = "table" if "table" in sdata.tables else list(sdata.tables.keys())[0]
     adata = sdata.tables[table_key].copy()
     adata.obs_names = [f"{sample_name}_{c}" for c in adata.obs_names]
+    # Transfer Xenium cell centroid coordinates to adata.obsm["spatial"]
+    # so downstream spatial plotting and Squidpy functions work correctly.
+    # sdata.shapes may be keyed as "cell_circles" or "nucleus_boundaries" depending
+    # on spatialdata-io version; try common keys in order.
+    if "spatial" not in adata.obsm:
+        _coord_transferred = False
+        for _shape_key in ("cell_circles", "nucleus_boundaries", "cell_boundaries"):
+            if _shape_key in sdata.shapes:
+                import geopandas as _gpd
+                _shapes = sdata.shapes[_shape_key]
+                # Centroids: use centroid attribute (works for both circles and polygons)
+                _centroids = _shapes.geometry.centroid
+                _xy = np.column_stack([_centroids.x.values, _centroids.y.values])
+                # Match to adata obs by index (obs_names were prefixed above; use raw index)
+                if len(_xy) == adata.n_obs:
+                    adata.obsm["spatial"] = _xy
+                    print(f"  Xenium: transferred coordinates from sdata.shapes['{_shape_key}']")
+                    _coord_transferred = True
+                    break
+        if not _coord_transferred:
+            print("  Warning: could not find matching Xenium shape layer for coordinate transfer. "
+                  "Spatial plots may not render correctly.")
 else:
     raise ValueError(f"Unknown platform: {platform}. Use visium | visium_hd | xenium")
 

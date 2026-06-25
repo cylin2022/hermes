@@ -1,5 +1,6 @@
 # Snakemake script: doublet detection with scDblFinder
 suppressPackageStartupMessages({
+    library(DropletUtils)
     library(scDblFinder)
     library(SingleCellExperiment)
     library(BiocParallel)

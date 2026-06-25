@@ -44,8 +44,14 @@ gpu_available = torch.cuda.is_available()
 print(f"[{sample_name}] GPU available: {gpu_available}")
 
 import scvi
-_scvi_version = tuple(int(x) for x in scvi.__version__.split(".")[:2])
-# scvi-tools ≥ 0.20 uses accelerator/devices instead of use_gpu
+import re as _re
+# Handle pre-release version strings like "0.20.0a1" or "1.0.0.post1"
+_scvi_ver_match = _re.match(r"(\d+)\.(\d+)", scvi.__version__)
+if _scvi_ver_match:
+    _scvi_version = (int(_scvi_ver_match.group(1)), int(_scvi_ver_match.group(2)))
+else:
+    _scvi_version = (0, 0)
+# scvi-tools ≥ 0.20 uses accelerator/devices instead of use_gpu=
 if _scvi_version >= (0, 20):
     _train_kwargs = {"accelerator": "gpu" if gpu_available else "cpu", "devices": 1}
 else:
@@ -54,6 +60,33 @@ else:
 # ── Load data ─────────────────────────────────────────────────────────────────
 adata_vis = sc.read_h5ad(h5ad_spatial)
 adata_ref = sc.read_h5ad(h5ad_reference)
+
+# Preflight: reference must be non-empty and have the required cell type column
+if adata_ref.n_obs == 0:
+    raise ValueError(
+        f"Reference h5ad '{h5ad_reference}' has 0 cells. "
+        "Provide a non-empty scRNA-seq reference."
+    )
+if celltype_col not in adata_ref.obs.columns:
+    raise ValueError(
+        f"Cell type column '{celltype_col}' not found in reference .obs. "
+        f"Available columns: {list(adata_ref.obs.columns)}"
+    )
+
+# Preflight: reference counts layer check — cell2location requires raw integer counts
+if "counts" not in adata_ref.layers:
+    import scipy.sparse as _sp
+    X = adata_ref.X
+    X_dense = X.toarray() if _sp.issparse(X) else X
+    if not np.allclose(X_dense, np.round(X_dense)):
+        raise ValueError(
+            "Reference adata.X does not appear to contain raw integer counts "
+            "and no 'counts' layer was found. "
+            "Please provide raw (un-normalized) counts in .X or .layers['counts']."
+        )
+    print("  Warning: no 'counts' layer in reference; using .X (appears to be integer counts)")
+else:
+    print("  Found 'counts' layer in reference; will use it for cell2location.")
 
 print(f"  Spatial: {adata_vis.n_obs} spots × {adata_vis.n_vars} genes")
 print(f"  Reference: {adata_ref.n_obs} cells × {adata_ref.n_vars} genes")
@@ -123,6 +156,11 @@ adata_vis_sub = mod_c2l.export_posterior(
 # ── Extract and store cell type abundances ────────────────────────────────────
 # Use 5th percentile estimates (conservative, avoids noise)
 ctypes = inf_aver_sub.columns.tolist()
+# Assert expected output key exists after export_posterior
+assert "q05_cell_abundance_w_sf" in adata_vis_sub.obsm, (
+    "cell2location export_posterior did not produce 'q05_cell_abundance_w_sf' in .obsm. "
+    f"Available keys: {list(adata_vis_sub.obsm.keys())}"
+)
 if "q05_cell_abundance_w_sf" in adata_vis_sub.obsm:
     cell_abund = adata_vis_sub.obsm["q05_cell_abundance_w_sf"]
     # cell2location column names may be prefixed; force rename to clean cell type names

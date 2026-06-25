@@ -16,12 +16,16 @@ MIN_COV     = config.get("min_coverage",    20)
 MAX_COV     = config.get("max_coverage",   300)
 WINDOW      = config.get("window_size",  50000)
 STEP        = config.get("step_size",    10000)
+PLOIDY      = config.get("ploidy",           2)   # haploid count = pool_size * ploidy
 OUTDIR      = config["outdir"]
 COMPARISONS = config["comparisons"]
 COMP_NAMES  = [c["name"] for c in COMPARISONS]
 
-# ── all ───────────────────────────────────────────────────────────────────────
-# ── Preflight: resource check before any job starts ───────────────────────────
+wildcard_constraints:
+    sample = "|".join(SAMPLES),
+    comp   = "|".join(COMP_NAMES),
+
+# ── preflight ─────────────────────────────────────────────────────────────────
 onstart:
     import sys as _sys
     _sys.path.insert(0, str(Path(workflow.snakefile).parent.parent / "common"))
@@ -50,6 +54,7 @@ rule fastp:
     conda: "envs/align.yaml"
     shell:
         """
+        set -euo pipefail
         fastp -i {input.r1} -I {input.r2} \
               -o {output.r1} -O {output.r2} \
               --html {output.html} --json {output.json} \
@@ -57,6 +62,8 @@ rule fastp:
               --detect_adapter_for_pe \
               --qualified_quality_phred 20 \
               --length_required 50
+        test -s {output.r1}   || {{ echo "ERROR: fastp R1 empty" >&2; exit 1; }}
+        test -s {output.html} || {{ echo "ERROR: fastp HTML empty" >&2; exit 1; }}
         """
 
 # ── genome index ──────────────────────────────────────────────────────────────
@@ -66,6 +73,12 @@ rule bwa_index:
     threads: 4
     conda: "envs/align.yaml"
     shell: "bwa-mem2 index {input}"
+
+rule samtools_fai:
+    input:  GENOME
+    output: GENOME + ".fai"
+    conda:  "envs/align.yaml"
+    shell:  "samtools faidx {input}"
 
 # ── align ─────────────────────────────────────────────────────────────────────
 rule bwa_align:
@@ -81,11 +94,14 @@ rule bwa_align:
     conda: "envs/align.yaml"
     shell:
         """
+        set -euo pipefail
         bwa-mem2 mem -t {threads} \
             -R '@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}\\tPL:ILLUMINA' \
             {GENOME} {input.r1} {input.r2} \
         | samtools sort -@ 4 -m 4G -o {output.bam}
         samtools index {output.bam}
+        test -s {output.bam} || {{ echo "ERROR: BAM missing or empty for {wildcards.sample}" >&2; exit 1; }}
+        test -s {output.bai} || {{ echo "ERROR: BAM index missing for {wildcards.sample}" >&2; exit 1; }}
         """
 
 # ── variant calling (all pools jointly) ───────────────────────────────────────
@@ -97,6 +113,7 @@ rule call_variants:
         bams=expand(f"{OUTDIR}/bam/{{sample}}.bam", sample=SAMPLES),
         bais=expand(f"{OUTDIR}/bam/{{sample}}.bam.bai", sample=SAMPLES),
         ref=GENOME,
+        fai=GENOME + ".fai",
     output:
         vcf=f"{OUTDIR}/variants/pools.vcf.gz",
         tbi=f"{OUTDIR}/variants/pools.vcf.gz.tbi",
@@ -105,6 +122,8 @@ rule call_variants:
     conda: "envs/align.yaml"
     shell:
         """
+        set -euo pipefail
+        mkdir -p {OUTDIR}/variants
         bcftools mpileup \
             -f {input.ref} \
             -a AD,DP \
@@ -115,6 +134,8 @@ rule call_variants:
             {input.bams} \
         | bcftools call -m -v -Oz -o {output.vcf}
         bcftools index -t {output.vcf}
+        test -s {output.vcf} || {{ echo "ERROR: VCF missing or empty" >&2; exit 1; }}
+        test -s {output.tbi} || {{ echo "ERROR: VCF index missing" >&2; exit 1; }}
         """
 
 # ── extract allele depths as flat TSV ────────────────────────────────────────
@@ -124,11 +145,13 @@ rule extract_ad:
     conda: "envs/align.yaml"
     shell:
         """
+        set -euo pipefail
         bcftools query \
             -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%AD]\\n' \
             -i 'TYPE="snp" && N_ALT=1' \
             {input.vcf} \
         | bgzip -c > {output.ad}
+        test -s {output.ad} || {{ echo "ERROR: AD table empty — no biallelic SNPs?" >&2; exit 1; }}
         """
 
 # ── Fst (one job per comparison) ──────────────────────────────────────────────
@@ -143,6 +166,7 @@ rule fst_analysis:
         comparison  = lambda wc: next(c for c in COMPARISONS if c["name"] == wc.comp),
         samples     = SAMPLES,
         pool_sizes  = [POOL_SIZE[s] for s in SAMPLES],
+        ploidy      = PLOIDY,
         window      = WINDOW,
         step        = STEP,
         min_cov     = MIN_COV,

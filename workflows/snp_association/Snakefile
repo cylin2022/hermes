@@ -98,6 +98,7 @@ rule prepare_inputs:
 rule vcf_to_plink:
     input:
         vcf   = INPUT_VCF,
+        tbi   = INPUT_VCF + ".tbi",
         pheno = str(OUTDIR / "inputs" / "phenotype.txt"),
     output:
         bed = PFX + ".bed",
@@ -115,6 +116,7 @@ rule vcf_to_plink:
     conda: "envs/plink2.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p $(dirname {params.pfx})
         plink2 \
             --vcf {input.vcf} \
@@ -131,6 +133,7 @@ rule vcf_to_plink:
             --allow-extra-chr \
             --set-all-var-ids '@:#:$r:$a' \
             --new-id-max-allele-len 100 missing
+        test -s {output.bed} || {{ echo 'ERROR: bed empty' >&2; exit 1; }}
         """
 
 # ── LD pruning ────────────────────────────────────────────────────────────────
@@ -149,8 +152,10 @@ rule ld_prune:
     conda: "envs/plink2.yaml"
     shell:
         """
+        set -euo pipefail
         plink2 --bfile {params.p} --threads {threads} --indep-pairwise 50 10 0.1 \
                --out {params.pfx} --allow-extra-chr
+        test -s {output.keep} || {{ echo 'ERROR: pruned.prune.in empty' >&2; exit 1; }}
         """
 
 # ── PCA ───────────────────────────────────────────────────────────────────────
@@ -171,9 +176,11 @@ rule pca:
     conda: "envs/plink2.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p $(dirname {params.pfx})
         plink2 --bfile {params.p} --threads {threads} --extract {input.keep} \
                --pca {params.n} --out {params.pfx} --allow-extra-chr
+        test -s {output.vec} || {{ echo 'ERROR: pca.eigenvec empty' >&2; exit 1; }}
         """
 
 # ── Kinship matrix (GEMMA) ───────────────────────────────────────────────────
@@ -192,8 +199,10 @@ rule kinship:
     conda: "envs/gemma.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p {params.outdir}
         gemma -bfile {params.pfx_in} -gk 1 -o kinship -outdir {params.outdir}
+        test -s {output.kin} || {{ echo 'ERROR: kinship.cXX.txt empty' >&2; exit 1; }}
         """
 
 # ── GWAS A: salt tolerance adjusted for body size ────────────────────────────
@@ -217,10 +226,12 @@ rule gwas_salt_adjusted:
     conda: "envs/gemma.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p {params.outdir}
         gemma -bfile {params.pfx_in} -k {input.kin} \
               {params.cov_flag} \
               -lmm 4 -o salt_adjusted -outdir {params.outdir}
+        test -s {output.assoc} || {{ echo 'ERROR: salt_adjusted.assoc.txt empty' >&2; exit 1; }}
         """
 
 # ── GWAS B: body size as phenotype (growth QTL scan) ─────────────────────────
@@ -244,17 +255,53 @@ if HAS_COV:
         conda: "envs/gemma.yaml"
         shell:
             """
-            # -n 1: use the phenotype file instead of .fam phenotype column
+            set -euo pipefail
+            # Re-order bodysize phenotype file to match post-QC .fam sample order.
+            # prepare_inputs.py wrote pheno in raw VCF order; QC may have dropped samples.
+            python3 - <<'PYEOF'
+import sys
+# Build {sample_id: pheno_value} from the raw pheno file (one value per line,
+# written in VCF sample order — we need to map it back via the plink pheno file).
+# The plink phenotype.txt (FID IID PHENOTYPE) was also written by prepare_inputs.
+# For body size we use the z-scored value from bodysize_phenotype.txt, which has
+# the same row order as the raw VCF samples.  Read both to rebuild a dict.
+import csv, pathlib
+plink_pheno = pathlib.Path("{params.pfx_in}").parent.parent / "inputs" / "phenotype.txt"
+bs_pheno    = pathlib.Path("{input.pheno}")
+fam_file    = pathlib.Path("{input.fam}")
+
+# Read VCF-ordered IIDs from PLINK pheno file (FID IID PHENOTYPE header)
+with open(plink_pheno) as fh:
+    rows = list(csv.reader(fh, delimiter="\\t"))
+vcf_iids = [r[1] for r in rows[1:]]   # skip header
+
+# Read bodysize values (same row order as VCF)
+bs_values = bs_pheno.read_text().splitlines()
+
+bs_map = dict(zip(vcf_iids, bs_values))
+
+# Read post-QC FAM sample order (col 2 = IID)
+fam_iids = [line.split()[1] for line in fam_file.read_text().splitlines() if line.strip()]
+
+# Write reordered bodysize pheno
+out_path = pathlib.Path("{params.outdir}") / "bodysize_pheno_ordered.txt"
+out_path.parent.mkdir(parents=True, exist_ok=True)
+with open(out_path, "w") as fh:
+    for iid in fam_iids:
+        fh.write(bs_map.get(iid, "NA") + "\\n")
+PYEOF
             # GEMMA -lmm on continuous phenotype (body weight z-score)
             gemma -bfile {params.pfx_in} -k {input.kin} \
-                  -p {input.pheno} \
+                  -p {params.outdir}/bodysize_pheno_ordered.txt \
                   -lmm 4 -o bodysize -outdir {params.outdir}
+            test -s {output.assoc} || {{ echo 'ERROR: bodysize.assoc.txt empty' >&2; exit 1; }}
             """
 
 # ── Fst ───────────────────────────────────────────────────────────────────────
 rule fst_persnp:
     input:
         vcf  = INPUT_VCF,
+        tbi  = INPUT_VCF + ".tbi",
         pop1 = str(OUTDIR / "inputs" / "pop_tolerant.txt"),
         pop2 = str(OUTDIR / "inputs" / "pop_intolerant.txt"),
     output:
@@ -265,15 +312,18 @@ rule fst_persnp:
     conda: "envs/plink2.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p $(dirname {params.pfx})
         vcftools --gzvcf {input.vcf} \
             --weir-fst-pop {input.pop1} --weir-fst-pop {input.pop2} \
             --out {params.pfx} 2> {output.log}
+        test -s {output.fst} || {{ echo 'ERROR: persnp.weir.fst empty' >&2; exit 1; }}
         """
 
 rule fst_window:
     input:
         vcf  = INPUT_VCF,
+        tbi  = INPUT_VCF + ".tbi",
         pop1 = str(OUTDIR / "inputs" / "pop_tolerant.txt"),
         pop2 = str(OUTDIR / "inputs" / "pop_intolerant.txt"),
     output:
@@ -286,10 +336,12 @@ rule fst_window:
     conda: "envs/plink2.yaml"
     shell:
         """
+        set -euo pipefail
         vcftools --gzvcf {input.vcf} \
             --weir-fst-pop {input.pop1} --weir-fst-pop {input.pop2} \
             --fst-window-size {params.win} --fst-window-step {params.step} \
             --out {params.pfx} 2> {output.log}
+        test -s {output.fst} || {{ echo 'ERROR: window.windowed.weir.fst empty' >&2; exit 1; }}
         """
 
 # ── Plots ─────────────────────────────────────────────────────────────────────

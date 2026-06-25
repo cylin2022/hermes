@@ -91,6 +91,7 @@ rule fastp_hifi:
     log:    "results/{sample}/logs/fastp.log"
     shell:
         r"""
+        set -euo pipefail
         fastp \
             -i {input} -o {output.fq} \
             --json {output.json} --html {output.html} \
@@ -99,6 +100,8 @@ rule fastp_hifi:
             --length_required 1000 \
             --disable_trim_poly_g \
             --thread {threads} 2>{log}
+        test -s {output.fq}   || {{ echo 'ERROR: fastp output empty' >&2; exit 1; }}
+        test -s {output.json} || {{ echo 'ERROR: fastp json empty'   >&2; exit 1; }}
         """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,6 +120,7 @@ rule host_removal:
     log:    "results/{sample}/logs/host_removal.log"
     shell:
         r"""
+        set -euo pipefail
         TOTAL=$(zcat {input.reads} | awk 'NR%4==1' | wc -l)
         minimap2 -ax map-hifi -t {threads} {input.host} {input.reads} 2>{log} \
           | samtools view -@ 4 -f 4 -F 256 -b \
@@ -125,6 +129,7 @@ rule host_removal:
         CLEAN=$(zcat {output.clean} | awk 'NR%4==1' | wc -l)
         printf "Total\t%d\nClean\t%d\nHost_removed\t%d\n" \
             $TOTAL $CLEAN $(($TOTAL - $CLEAN)) > {output.stats}
+        test -s {output.clean} || {{ echo 'ERROR: host_removal output empty' >&2; exit 1; }}
         """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,6 +147,7 @@ rule kraken2:
     log:    "results/{sample}/logs/kraken2.log"
     shell:
         r"""
+        set -euo pipefail
         kraken2 \
             --db {params.db} \
             --threads {threads} \
@@ -150,6 +156,7 @@ rule kraken2:
             --use-names \
             --confidence 0.1 \
             {input} 2>{log} | gzip > {output.out}
+        test -s {output.report} || {{ echo 'ERROR: kraken2 report empty' >&2; exit 1; }}
         """
 
 rule bracken:
@@ -162,15 +169,22 @@ rule bracken:
     log:    "results/{sample}/logs/bracken.log"
     shell:
         r"""
+        set -euo pipefail
         bracken -d {params.db} -i {input} -o {output.sp}  -l S -t 10 2>  {log}
         bracken -d {params.db} -i {input} -o {output.gen} -l G -t 10 2>> {log}
+        test -s {output.sp} || {{ echo 'ERROR: bracken species output empty' >&2; exit 1; }}
         """
 
 rule krona:
     input:  "results/{sample}/kraken2/{sample}.report"
     output: "results/{sample}/krona/{sample}.html"
     conda:  "envs/kraken.yaml"
-    shell:  "ktImportTaxonomy -t 5 -m 3 -o {output} {input}"
+    shell:
+        r"""
+        set -euo pipefail
+        ktImportTaxonomy -t 5 -m 3 -o {output} {input}
+        test -s {output} || {{ echo 'ERROR: krona output empty' >&2; exit 1; }}
+        """
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module B  Assembly
@@ -187,6 +201,7 @@ rule hifiasm_meta:
     log:    "results/{sample}/logs/hifiasm_meta.log"
     shell:
         r"""
+        set -euo pipefail
         hifiasm --meta -t {threads} -o {params.prefix} {input} 2>{log}
 
         # GFA → FASTA with length filter
@@ -197,6 +212,7 @@ rule hifiasm_meta:
             }}' > {output}
 
         echo "Contigs >= {params.min_len} bp: $(grep -c '^>' {output})" >> {log}
+        test -s {output} || {{ echo 'ERROR: hifiasm_meta assembly empty' >&2; exit 1; }}
         """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,25 +222,35 @@ rule map_to_assembly:
     input:
         reads    = get_clean_reads,
         assembly = "results/{sample}/assembly/{sample}.p_ctg.fa",
-    output: "results/{sample}/coverage/{sample}.sorted.bam"
+    output:
+        bam = "results/{sample}/coverage/{sample}.sorted.bam",
+        bai = "results/{sample}/coverage/{sample}.sorted.bam.bai",
     threads: config["threads"]
     resources: mem_mb = 32_000
     conda:  "envs/host_removal.yaml"
     log:    "results/{sample}/logs/map_to_assembly.log"
     shell:
         r"""
+        set -euo pipefail
         minimap2 -ax map-hifi -t {threads} {input.assembly} {input.reads} 2>{log} \
-          | samtools sort -@ 8 -o {output}
-        samtools index {output}
+          | samtools sort -@ 8 -o {output.bam}
+        samtools index {output.bam}
+        test -s {output.bam} || {{ echo 'ERROR: map_to_assembly BAM empty' >&2; exit 1; }}
+        test -s {output.bai} || {{ echo 'ERROR: map_to_assembly BAI empty' >&2; exit 1; }}
         """
 
 rule jgi_depth:
-    input:  "results/{sample}/coverage/{sample}.sorted.bam"
+    input:  bam = "results/{sample}/coverage/{sample}.sorted.bam",
+            bai = "results/{sample}/coverage/{sample}.sorted.bam.bai",
     output: "results/{sample}/coverage/{sample}.depth.txt"
     conda:  "envs/binning.yaml"
     log:    "results/{sample}/logs/jgi_depth.log"
     shell:
-        "jgi_summarize_bam_contig_depths --outputDepth {output} {input} 2>{log}"
+        r"""
+        set -euo pipefail
+        jgi_summarize_bam_contig_depths --outputDepth {output} {input.bam} 2>{log}
+        test -s {output} || {{ echo 'ERROR: jgi_depth output empty' >&2; exit 1; }}
+        """
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module B  Binning
@@ -243,6 +269,7 @@ rule metabat2:
     log:     "results/{sample}/logs/metabat2.log"
     shell:
         r"""
+        set -euo pipefail
         mkdir -p {params.outdir}
         metabat2 -i {input.assembly} -a {input.depth} \
             -o {params.outdir}/bin -m {params.min_len} \
@@ -253,6 +280,7 @@ rule semibin2:
     input:
         assembly = "results/{sample}/assembly/{sample}.p_ctg.fa",
         bam      = "results/{sample}/coverage/{sample}.sorted.bam",
+        bai      = "results/{sample}/coverage/{sample}.sorted.bam.bai",
     output:  touch("results/{sample}/binning/semibin2/.done")
     params:
         outdir = "results/{sample}/binning/semibin2",
@@ -263,6 +291,7 @@ rule semibin2:
     log:     "results/{sample}/logs/semibin2.log"
     shell:
         r"""
+        set -euo pipefail
         SemiBin2 single_easy_bin \
             -i {input.assembly} -b {input.bam} \
             -o {params.outdir} \
@@ -270,22 +299,42 @@ rule semibin2:
             -t {threads} 2>{log}
         """
 
+def make_scaffold2bin_done_inputs(wildcards):
+    files = []
+    if "metabat2" in BINNERS:
+        files.append(f"results/{wildcards.sample}/binning/metabat2/.done")
+    if "semibin2" in BINNERS:
+        files.append(f"results/{wildcards.sample}/binning/semibin2/.done")
+    return files
+
 rule make_scaffold2bin:
     input:
-        mb2 = "results/{sample}/binning/metabat2/.done",
-        sb2 = "results/{sample}/binning/semibin2/.done",
+        make_scaffold2bin_done_inputs,
     output:
         mb2 = "results/{sample}/binning/metabat2/scaffold2bin.tsv",
         sb2 = "results/{sample}/binning/semibin2/scaffold2bin.tsv",
     conda: "envs/binning.yaml"
     shell:
         r"""
-        Fasta_to_Scaffolds2Bin.sh \
-            -i results/{wildcards.sample}/binning/metabat2 -e fa \
-            > {output.mb2}
-        Fasta_to_Scaffolds2Bin.sh \
-            -i results/{wildcards.sample}/binning/semibin2/output_bins -e fa.gz \
-            > {output.sb2}
+        set -euo pipefail
+        if python3 -c "import sys; sys.exit(0 if 'metabat2' in {BINNERS!r} else 1)"; then
+            Fasta_to_Scaffolds2Bin.sh \
+                -i results/{wildcards.sample}/binning/metabat2 -e fa \
+                > {output.mb2}
+            test -s {output.mb2} \
+                || {{ echo 'ERROR: metabat2 scaffold2bin empty' >&2; exit 1; }}
+        else
+            touch {output.mb2}
+        fi
+        if python3 -c "import sys; sys.exit(0 if 'semibin2' in {BINNERS!r} else 1)"; then
+            Fasta_to_Scaffolds2Bin.sh \
+                -i results/{wildcards.sample}/binning/semibin2/output_bins -e fa \
+                > {output.sb2}
+            test -s {output.sb2} \
+                || {{ echo 'ERROR: semibin2 scaffold2bin empty' >&2; exit 1; }}
+        else
+            touch {output.sb2}
+        fi
         """
 
 rule das_tool:
@@ -305,6 +354,7 @@ rule das_tool:
     log:     "results/{sample}/logs/das_tool.log"
     shell:
         r"""
+        set -euo pipefail
         DAS_Tool \
             -i {params.tsv_arg} \
             -l {params.labels} \
@@ -314,6 +364,7 @@ rule das_tool:
             --write_bins \
             --search_engine diamond \
             --score_threshold 0.5 2>{log}
+        test -s {output.score} || {{ echo 'ERROR: DAS_Tool summary empty' >&2; exit 1; }}
         """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -331,6 +382,7 @@ rule checkm2:
     log:     "results/{sample}/logs/checkm2.log"
     shell:
         r"""
+        set -euo pipefail
         checkm2 predict \
             --threads {threads} \
             --input {input} \
@@ -338,6 +390,7 @@ rule checkm2:
             --database_path {params.db}/uniref100.KO.1.dmnd \
             --extension fa \
             --force 2>{log}
+        test -s {output} || {{ echo 'ERROR: checkm2 quality_report empty' >&2; exit 1; }}
         """
 
 rule filter_hq_mags:
@@ -352,6 +405,7 @@ rule filter_hq_mags:
     conda: "envs/checkm2.yaml"
     shell:
         r"""
+        set -euo pipefail
         mkdir -p {params.outdir}
         python3 -c "
 import pandas as pd, shutil, os, sys
@@ -365,7 +419,7 @@ for _, row in hq.iterrows():
     if os.path.exists(src):
         shutil.copy(src, out_dir)
         n += 1
-print(f'HQ MAGs: {n}  (comp>={min_c}%, cont<={max_co}%)')
+print(f'HQ MAGs: {{n}}  (comp>=={{min_c}}%, cont<=={{max_co}}%)')
 " {input.qc} {input.bins} {params.outdir} {params.min_comp} {params.max_cont}
         """
 
@@ -385,6 +439,7 @@ rule gtdbtk:
     log:     "results/{sample}/logs/gtdbtk.log"
     shell:
         r"""
+        set -euo pipefail
         # Abort gracefully if no HQ MAGs were produced
         n=$(ls {params.mags_dir}/*.fa 2>/dev/null | wc -l)
         if [ "$n" -eq 0 ]; then
@@ -399,6 +454,17 @@ rule gtdbtk:
             --cpus {threads} \
             --skip_ani_screen \
             --force 2>{log}
+        # Fallback: archaea-only dataset produces ar53 summary but no bac120 summary
+        if [ ! -f {output} ]; then
+            if [ -f {params.out_dir}/gtdbtk.ar53.summary.tsv ]; then
+                echo "Archaeal-only dataset; creating stub bac120 summary." >&2
+                head -1 {params.out_dir}/gtdbtk.ar53.summary.tsv > {output}
+            else
+                echo "ERROR: GTDB-Tk produced neither bac120 nor ar53 summary." >&2
+                exit 1
+            fi
+        fi
+        test -s {output} || {{ echo 'ERROR: gtdbtk bac120 summary empty' >&2; exit 1; }}
         """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -416,6 +482,17 @@ rule pyrodigal:
     log:    "results/{sample}/logs/pyrodigal.log"
     shell:
         r"""
+        set -euo pipefail
+        mkdir -p results/{wildcards.sample}/functional/genes
+
+        # Nullglob guard: skip gracefully if no HQ MAGs exist
+        n=$(ls {params.mags_dir}/*.fa 2>/dev/null | wc -l)
+        if [ "$n" -eq 0 ]; then
+            echo "No HQ MAGs found; writing empty outputs." >&2
+            touch {output.faa} {output.fna} {output.gff}
+            exit 0
+        fi
+
         # Prefix each contig with its bin name to keep provenance
         for f in {params.mags_dir}/*.fa; do
             bin=$(basename "$f" .fa)
@@ -427,6 +504,7 @@ rule pyrodigal:
             -a {output.faa} -d {output.fna} -f gff \
             -p meta -j {threads} \
             > {output.gff} 2>{log}
+        test -s {output.faa} || {{ echo 'ERROR: pyrodigal FAA output empty' >&2; exit 1; }}
         """
 
 rule diamond_nr:
@@ -439,6 +517,7 @@ rule diamond_nr:
     log:    "results/{sample}/logs/diamond_nr.log"
     shell:
         r"""
+        set -euo pipefail
         diamond blastp \
             -q {input} -d {params.db} -o {output} \
             --outfmt 6 qseqid sseqid pident length evalue bitscore staxids sscinames \
@@ -447,6 +526,7 @@ rule diamond_nr:
             --max-target-seqs 1 \
             --more-sensitive \
             --block-size 6 --index-chunks 1 2>{log}
+        test -s {output} || {{ echo 'ERROR: diamond_nr output empty' >&2; exit 1; }}
         """
 
 rule eggnog:
@@ -461,6 +541,7 @@ rule eggnog:
     log:    "results/{sample}/logs/eggnog.log"
     shell:
         r"""
+        set -euo pipefail
         emapper.py \
             -i {input} --itype proteins \
             --data_dir {params.db} \
@@ -471,6 +552,7 @@ rule eggnog:
             --tax_scope auto \
             --override \
             --no_file_comments 2>{log}
+        test -s {output} || {{ echo 'ERROR: eggnog annotations empty' >&2; exit 1; }}
         """
 
 rule interproscan:
@@ -482,15 +564,18 @@ rule interproscan:
     log:    "results/{sample}/logs/interproscan.log"
     shell:
         r"""
-        # InterProScan rejects stop-codon asterisks
-        sed 's/\*//g' {input} > {input}.tmp.faa
+        set -euo pipefail
+        # InterProScan rejects stop-codon asterisks; use mktemp to avoid polluting input dir
+        TMPFAA=$(mktemp --suffix=.faa)
+        trap 'rm -f "$TMPFAA"' EXIT
+        sed 's/\*//g' {input} > "$TMPFAA"
         {params.ipr}/interproscan.sh \
-            -i {input}.tmp.faa \
+            -i "$TMPFAA" \
             -o {output} -f TSV \
             -cpu {threads} \
             --goterms --pathways \
             --disable-precalc 2>{log}
-        rm {input}.tmp.faa
+        test -s {output} || {{ echo 'ERROR: interproscan output empty' >&2; exit 1; }}
         """
 
 # Report is handled by workflows/report/Snakefile (universal cross-workflow reporter)

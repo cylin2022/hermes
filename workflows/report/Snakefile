@@ -76,10 +76,12 @@ rule multiqc:
     conda: "envs/report.yaml"
     shell:
         r"""
+        set -euo pipefail
         multiqc {params.results} \
             -o {params.outdir} \
             -n multiqc_report \
             --force -q
+        test -s {output} || { echo 'ERROR: multiqc_report.html empty' >&2; exit 1; }
         """
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -145,8 +147,8 @@ elif WORKFLOW == "wgs_snp":
 
     rule wgs_snp_variant_summary:
         input:
-            stats = f"{RESULTS_DIR}/variant_stats.txt",
-            snpeff = f"{RESULTS_DIR}/snpeff_summary.html",
+            stats  = f"{RESULTS_DIR}/stats/variant_summary.txt",
+            snpeff = f"{RESULTS_DIR}/annotation/snpeff_summary.html",
         output: f"{OUTPUT_DIR}/tables/variant_summary.tsv"
         params: results_dir = RESULTS_DIR
         conda:  "envs/report.yaml"
@@ -176,15 +178,23 @@ elif WORKFLOW == "wgs_snp":
 elif WORKFLOW == "rnaseq":
 
     rule rnaseq_de_summary:
-        input:  f"{RESULTS_DIR}/deseq2/all_results.tsv"
+        # DESeq2 writes per-contrast files: {contrast}_results.tsv (no single all_results.tsv)
+        input:  expand(f"{RESULTS_DIR}/deseq2/{{contrast}}_results.tsv",
+                       contrast=config.get("contrasts", []))
         output: f"{OUTPUT_DIR}/tables/de_summary.tsv"
-        params: results_dir = RESULTS_DIR
+        params:
+            results_dir = RESULTS_DIR,
+            deseq2_dir  = f"{RESULTS_DIR}/deseq2",
         conda:  "envs/report.yaml"
         script: "scripts/rnaseq_de_summary.py"
 
     rule rnaseq_pca_plot:
-        input:  f"{RESULTS_DIR}/deseq2/vst_counts.tsv"
+        # vst_counts.tsv is not produced by rnaseq workflow; use first contrast rlog RDS
+        # as a fallback or produce a placeholder if no VST matrix is available.
+        input:  expand(f"{RESULTS_DIR}/deseq2/{{contrast}}_rlog.rds",
+                       contrast=config.get("contrasts", []))
         output: f"{OUTPUT_DIR}/figures/pca.png"
+        params: deseq2_dir = f"{RESULTS_DIR}/deseq2"
         conda:  "envs/report.yaml"
         script: "scripts/rnaseq_pca_plot.py"
 
@@ -206,8 +216,8 @@ elif WORKFLOW == "rnaseq":
 elif WORKFLOW == "scrnaseq":
 
     rule scrnaseq_cluster_summary:
-        input:  expand(f"{RESULTS_DIR}/{{sample}}/scanpy/cluster_markers.tsv",
-                       sample=SAMPLES)
+        # scrnaseq produces a single merged marker_genes.csv, not per-sample cluster_markers.tsv
+        input:  f"{RESULTS_DIR}/scanpy/marker_genes.csv"
         output: f"{OUTPUT_DIR}/tables/cluster_summary.tsv"
         params:
             results_dir = RESULTS_DIR,
@@ -216,8 +226,8 @@ elif WORKFLOW == "scrnaseq":
         script: "scripts/scrnaseq_cluster_summary.py"
 
     rule scrnaseq_umap_plot:
-        input:  expand(f"{RESULTS_DIR}/{{sample}}/scanpy/umap_leiden.png",
-                       sample=SAMPLES)
+        # scrnaseq produces a single merged umap_clusters.pdf, not per-sample umap_leiden.png
+        input:  f"{RESULTS_DIR}/scanpy/umap_clusters.pdf"
         output: f"{OUTPUT_DIR}/figures/umap.png"
         params:
             results_dir = RESULTS_DIR,
