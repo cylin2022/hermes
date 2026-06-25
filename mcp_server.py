@@ -6,7 +6,9 @@ Exposes local workflow control to Claude Code via MCP stdio protocol.
 Transport: stdio only (launched by Claude Code, not network-accessible).
 """
 
+import asyncio
 import json
+import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +21,51 @@ WF_DIR     = HERMES_DIR / "workflows"
 RUNS_DIR.mkdir(exist_ok=True)
 
 mcp = FastMCP("Hermes")
+
+ALL_WORKFLOWS = [
+    "pool_seq", "snp_association", "genomic_prediction",
+    "atacseq", "scrnaseq", "metagenome", "spatial", "report",
+    "rnaseq", "wgs_snp", "genome_annotation",
+]
+
+ISSUE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "workflow": {"type": "string"},
+        "critical_issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category":      {"type": "string"},
+                    "location":      {"type": "string"},
+                    "description":   {"type": "string"},
+                    "suggested_fix": {"type": "string"},
+                },
+                "required": ["category", "location", "description", "suggested_fix"],
+            },
+        },
+        "minor_issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category":      {"type": "string"},
+                    "location":      {"type": "string"},
+                    "description":   {"type": "string"},
+                    "suggested_fix": {"type": "string"},
+                },
+                "required": ["category", "location", "description", "suggested_fix"],
+            },
+        },
+        "verdict": {
+            "type": "string",
+            "enum": ["ready_to_run", "minor_fixes_needed", "critical_fixes_required"],
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["workflow", "critical_issues", "minor_issues", "verdict", "summary"],
+}
 
 
 # ── Workflow execution ────────────────────────────────────────────────────────
@@ -177,6 +224,177 @@ def list_files(directory: str, pattern: str = "*") -> list[str]:
     if not d.exists():
         return [f"Directory not found: {directory}"]
     return sorted(str(p) for p in d.glob(pattern))
+
+
+# ── Workflow critique (LLM-based code review) ────────────────────────────────
+
+def _bundle_workflow_files(wf_dir: Path) -> str:
+    parts = []
+    candidates = [
+        (wf_dir / "Snakefile",             None),
+        (wf_dir / "config_template.yaml",  None),
+        (wf_dir / "envs",                  "*.yaml"),
+        (wf_dir / "scripts",               "*.R"),
+        (wf_dir / "scripts",               "*.py"),
+    ]
+    for target, glob_pat in candidates:
+        if glob_pat:
+            if target.exists():
+                for f in sorted(target.glob(glob_pat)):
+                    parts.append(f"=== {f.relative_to(wf_dir)} ===\n{f.read_text(errors='replace')}")
+        elif target.exists():
+            parts.append(f"=== {target.name} ===\n{target.read_text(errors='replace')}")
+    return "\n\n".join(parts)
+
+
+def _critique_prompt(name: str, files_content: str, checklist: str) -> str:
+    return f"""You are a senior bioinformatics engineer doing an independent code review of the
+"{name}" Snakemake workflow. Review with fresh eyes — no knowledge of design decisions.
+Find bugs that cause crashes or wrong results in production.
+Cost of a missed bug: days of lost compute on a 160-core / 2.2 TiB server.
+
+## Workflow files
+
+{files_content}
+
+## PIPELINE_CHECKLIST.md
+
+{checklist}
+
+## What to check
+
+**Docker (CRITICAL):** --user $(id -u):$(id -g) on every docker run (EXCEPTION: BRAKER3 root).
+mkdir -p output dir BEFORE docker run. busybox chown for root-owned outputs.
+
+**Shell blocks (CRITICAL):** set -euo pipefail first line. test -s {{output}} after every command.
+sed back-references: use \\\\1 not \\1 (Python processes Snakemake shell strings first).
+
+**samtools order (CRITICAL):** fixmate requires name-sorted input (sort -n before fixmate).
+
+**Index files:** .fai/.bai/.csi/.tbi declared as inputs where tools require them.
+samtools >= 1.12 writes .csi (not .bai) for non-standard references.
+
+**Conda envs:** every library()/import must have a matching package in the conda yaml.
+
+**Statistics:** appropriate normalization, multiple-testing correction, NA/empty-output guards.
+
+Use the submit_review tool. Classify CRITICAL (crash or wrong result) vs MINOR (style/sub-optimal).
+Include file:line for every issue."""
+
+
+async def _critique_one(client, name: str, checklist: str) -> dict | None:
+    wf_dir = WF_DIR / name
+    if not wf_dir.exists():
+        return None
+    files_content = _bundle_workflow_files(wf_dir)
+
+    import anthropic as _anthropic
+    try:
+        response = await client.messages.create(
+            model       = "claude-sonnet-4-6",
+            max_tokens  = 4096,
+            tools       = [{
+                "name":         "submit_review",
+                "description":  "Submit structured code review findings",
+                "input_schema": ISSUE_SCHEMA,
+            }],
+            tool_choice = {"type": "tool", "name": "submit_review"},
+            messages    = [{"role": "user",
+                            "content": _critique_prompt(name, files_content, checklist)}],
+        )
+    except _anthropic.APIError as exc:
+        return {"workflow": name, "critical_issues": [], "minor_issues": [],
+                "verdict": "minor_fixes_needed", "summary": f"API error: {exc}"}
+
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "submit_review":
+            result = dict(block.input)
+            result["workflow"] = name
+            return result
+    return None
+
+
+async def _synthesize(client, results: list[dict]) -> str:
+    details = []
+    for r in results:
+        crit = "\n".join(
+            f"  [{i['category']}] {i['location']}\n    {i['description']}\n    FIX: {i['suggested_fix']}"
+            for i in r.get("critical_issues", [])
+        ) or "  (none)"
+        minor = "\n".join(
+            f"  [{i['category']}] {i['location']}: {i['description']}"
+            for i in r.get("minor_issues", [])
+        ) or "  (none)"
+        details.append(
+            f"=== {r['workflow']} [{r['verdict']}] ===\n"
+            f"CRITICAL ({len(r.get('critical_issues',[]))}):\n{crit}\n"
+            f"MINOR ({len(r.get('minor_issues',[]))}):\n{minor}\n"
+            f"Summary: {r.get('summary','')}"
+        )
+
+    response = await client.messages.create(
+        model      = "claude-sonnet-4-6",
+        max_tokens = 2048,
+        messages   = [{"role": "user", "content": (
+            "Synthesize these code-review results for Hermes bioinformatics workflows.\n\n"
+            + "\n\n".join(details)
+            + "\n\n"
+            "## 1. Overall verdict (1-2 sentences)\n"
+            "## 2. Workflows ready to run\n"
+            "## 3. Critical fixes required (group by workflow; exact code fixes)\n"
+            "## 4. Systemic patterns (issues in 2+ workflows)\n"
+            "## 5. Next steps\n"
+            "Be specific. Exact code where possible. No filler."
+        )}],
+    )
+    return response.content[0].text
+
+
+@mcp.tool()
+async def critique_workflow(workflows: list[str] | None = None) -> dict:
+    """
+    Run independent LLM code review of Hermes workflow(s) before production.
+
+    Equivalent to: Workflow({ scriptPath: critique.js, args: workflows })
+    Requires ANTHROPIC_API_KEY in the MCP server environment.
+
+    Args:
+        workflows: Workflow names to review, e.g. ["pool_seq", "rnaseq"].
+                   Omit to review all 11 workflows (~2-4 min).
+    Returns:
+        { findings, synthesis, stats: {n_reviewed, n_critical, n_minor} }
+    """
+    import anthropic as _anthropic
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return {"error": "ANTHROPIC_API_KEY not set in MCP server environment"}
+
+    targets = workflows if workflows else ALL_WORKFLOWS
+    invalid = [w for w in targets if not (WF_DIR / w).exists()]
+    if invalid:
+        return {"error": f"Unknown workflow(s): {invalid}. Available: {ALL_WORKFLOWS}"}
+
+    checklist = (HERMES_DIR / "PIPELINE_CHECKLIST.md").read_text() \
+        if (HERMES_DIR / "PIPELINE_CHECKLIST.md").exists() else ""
+
+    client  = _anthropic.AsyncAnthropic(api_key=api_key)
+    results = await asyncio.gather(
+        *[_critique_one(client, name, checklist) for name in targets],
+        return_exceptions=True,
+    )
+
+    valid      = [r for r in results if isinstance(r, dict)]
+    n_critical = sum(len(r.get("critical_issues", [])) for r in valid)
+    n_minor    = sum(len(r.get("minor_issues",    [])) for r in valid)
+
+    synthesis = await _synthesize(client, valid) if valid else ""
+
+    return {
+        "findings":  valid,
+        "synthesis": synthesis,
+        "stats":     {"n_reviewed": len(valid), "n_critical": n_critical, "n_minor": n_minor},
+    }
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
