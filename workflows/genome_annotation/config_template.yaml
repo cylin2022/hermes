@@ -60,7 +60,7 @@ recover_dir: ""
 #       Run EDTA + RepeatModeler in parallel, merge with CD-HIT-EST at 80% identity.
 #       Best sensitivity; runtime dominated by RepeatModeler (~50–100 h).
 #
-repeat_tool: "repeatmodeler"
+repeat_tool: "edta"
 
 # ── BUSCO ─────────────────────────────────────────────────────────────────────
 run_busco: true

@@ -51,7 +51,7 @@ RECOVER_DIR     = config.get("recover_dir", "")
 #   "repeatmodeler" (default) — RepeatModeler only, ~50-100h for 1 Gb genome
 #   "edta"                    — EDTA only, ~5-15h; faster but misses some SINE/small repeats
 #   "both"                    — run both and merge libraries; best sensitivity, slowest
-REPEAT_TOOL = config.get("repeat_tool", "repeatmodeler")
+REPEAT_TOOL = config.get("repeat_tool", "edta")
 USE_EDTA    = REPEAT_TOOL in ("edta", "both")
 
 RUN_BUSCO       = str(config.get("run_busco", "true")).lower() == "true"
