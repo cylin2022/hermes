@@ -87,5 +87,13 @@ busco_threads:    40   # HMMER-based; diminishing returns past ~64
 diamond_threads:  80   # excellent linear scaling
 ipr_threads:      40   # Java workers; ~40 saturates most analyses
 
+# ── Synteny (hap1 vs hap2, optional) ─────────────────────────────────────────
+# Compares genome_fasta (hap1/query) against a second assembly using minimap2
+# asm5 alignment → SyRI (synteny + rearrangement calling) → plotsr PDF.
+# Leave run_synteny: false to skip this section entirely.
+run_synteny: false
+hap2_fasta: ""               # path to second haplotype or reference assembly
+synteny_threads: 16
+
 # ── Output ────────────────────────────────────────────────────────────────────
 outdir: "/path/to/output"

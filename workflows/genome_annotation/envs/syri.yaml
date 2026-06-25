@@ -1,0 +1,10 @@
+name: syri
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - minimap2>=2.26
+  - samtools>=1.20
+  - syri>=1.7.0
+  - plotsr>=1.1.1

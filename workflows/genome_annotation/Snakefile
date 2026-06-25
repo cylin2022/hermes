@@ -64,6 +64,13 @@ INTERPROSCAN    = config.get("interproscan_dir", "/home/cylin/Vet_Hamaguri/datab
 THREADS         = int(config.get("threads", 64))
 MEM_GB          = int(config.get("mem_gb", 256))
 
+RUN_SYNTENY     = str(config.get("run_synteny", "false")).lower() == "true"
+HAP2_FA         = config.get("hap2_fasta", "")
+SYNTENY_THREADS = int(config.get("synteny_threads", 16))
+
+if RUN_SYNTENY and not HAP2_FA:
+    raise ValueError("run_synteny=true requires hap2_fasta to be set in config")
+
 # Per-tool thread overrides — allows parallel execution of downstream rules.
 # When busco_threads + diamond_threads + ipr_threads == total cores, all three
 # run simultaneously after BRAKER3 completes (e.g. 40+80+40 = 160 cores).
@@ -83,6 +90,10 @@ elif REPEAT_TOOL == "both":
 else:
     FINAL_REPEAT_LIB = str(OUTDIR / "repeats" / f"{SPECIES_NAME}-families.fa")
 
+wildcard_constraints:
+    chunk  = r"[0-9]{3}",
+    sample = r"[^/]+",
+
 # ── Preflight: resource check before any job starts ───────────────────────────
 onstart:
     import sys as _sys
@@ -101,6 +112,7 @@ rule all:
         str(OUTDIR / "annotation" / "diamond_nr.tsv"),
         str(OUTDIR / "annotation" / "interproscan.tsv"),
         str(OUTDIR / "busco_proteins" / "short_summary.txt"),
+        str(OUTDIR / "synteny" / "plotsr.pdf") if RUN_SYNTENY else [],
 
 # ── BUSCO ─────────────────────────────────────────────────────────────────────
 if RUN_BUSCO:
@@ -118,6 +130,7 @@ if RUN_BUSCO:
         conda: "envs/busco.yaml"
         shell:
             """
+            set -euo pipefail
             busco -i {input.genome} \
                   -l {params.lineage} \
                   -o busco_run \
@@ -144,6 +157,7 @@ if REPEAT_TOOL != "edta" and REPEAT_STRATEGY == "standard":
         conda: "envs/repeatmodeler.yaml"
         shell:
             """
+            set -euo pipefail
             mkdir -p {params.dbdir}
             cd {params.dbdir}
             BuildDatabase -name {params.name} -engine ncbi {input.genome}
@@ -166,6 +180,7 @@ if REPEAT_TOOL != "edta" and REPEAT_STRATEGY == "standard":
         conda: "envs/repeatmodeler.yaml"
         shell:
             """
+            set -euo pipefail
             cd {params.outdir}
             RepeatModeler \
                 -database {params.db} \
@@ -173,6 +188,7 @@ if REPEAT_TOOL != "edta" and REPEAT_STRATEGY == "standard":
                 -engine ncbi \
                 -LTRStruct \
                 {params.recover}
+            test -s {output.lib} || {{ echo "ERROR: RepeatModeler produced no repeat library" >&2; exit 1; }}
             """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -213,6 +229,7 @@ if REPEAT_TOOL != "edta" and REPEAT_STRATEGY != "standard":
         conda: "envs/repeatmodeler.yaml"
         shell:
             """
+            set -euo pipefail
             mkdir -p {params.dbdir}
             cd {params.dbdir}
             BuildDatabase -name {params.name} -engine ncbi {input.genome}
@@ -236,6 +253,7 @@ if REPEAT_TOOL != "edta" and REPEAT_STRATEGY != "standard":
         conda: "envs/repeatmodeler.yaml"
         shell:
             """
+            set -euo pipefail
             mkdir -p {params.outdir}
             cd {params.outdir}
             RepeatModeler \
@@ -243,13 +261,16 @@ if REPEAT_TOOL != "edta" and REPEAT_STRATEGY != "standard":
                 -pa {params.pa} \
                 -engine ncbi \
                 -LTRStruct
-            # RepeatModeler writes output to working dir; locate and copy
+            # RepeatModeler writes output to working dir; locate and copy.
+            # Only write placeholder if RepeatModeler exited 0 but found no repeats
+            # (legitimate for small chunks). If RepeatModeler crashed, set -e catches it above.
             found=$(find {params.outdir} -name "*-families.fa" | head -1)
             if [ -n "$found" ]; then
                 cp "$found" {output.lib}
             else
                 printf ">chunk_{wildcards.chunk}_no_repeats_found\\nN\\n" > {output.lib}
             fi
+            test -s {output.lib} || {{ echo "ERROR: chunk repeat library empty" >&2; exit 1; }}
             """
 
     rule merge_repeat_libs:
@@ -268,6 +289,7 @@ if REPEAT_TOOL != "edta" and REPEAT_STRATEGY != "standard":
         conda: "envs/utils.yaml"
         shell:
             """
+            set -euo pipefail
             cat {input.libs} > {params.raw}
 
             # Cluster at 80% identity to remove cross-chunk redundant families.
@@ -285,6 +307,7 @@ if REPEAT_TOOL != "edta" and REPEAT_STRATEGY != "standard":
                 -M {resources.mem_mb} \
                 -d 0
             rm -f {params.raw}
+            test -s {output.lib} || {{ echo "ERROR: merged repeat library empty" >&2; exit 1; }}
             """
 
 # ── EDTA: structural TE annotation ────────────────────────────────────────────
@@ -306,6 +329,7 @@ if USE_EDTA:
         conda: "envs/edta.yaml"
         shell:
             """
+            set -euo pipefail
             mkdir -p {params.outdir}
             cd {params.outdir}
             EDTA.pl \
@@ -331,10 +355,12 @@ if USE_EDTA:
         conda: "envs/utils.yaml"
         shell:
             """
+            set -euo pipefail
             cat {input.rm_lib} {input.edta_lib} > {params.raw}
             cd-hit-est -i {params.raw} -o {output.lib} \
                 -c 0.80 -aS 0.80 -n 8 -T {threads} -M {resources.mem_mb} -d 0
             rm -f {params.raw}
+            test -s {output.lib} || {{ echo "ERROR: combined repeat library empty" >&2; exit 1; }}
             """
 
 def final_repeat_lib(wildcards):
@@ -357,6 +383,7 @@ rule repeatmasker:
     conda: "envs/repeatmodeler.yaml"
     shell:
         """
+        set -euo pipefail
         mkdir -p {params.outdir}
         RepeatMasker \
             -pa {threads} \
@@ -365,8 +392,11 @@ rule repeatmasker:
             -xsmall \
             -dir {params.outdir} \
             {input.genome}
-        mv {params.outdir}/{params.gname}.masked {output.masked} 2>/dev/null || cp {input.genome} {output.masked}
-        mv {params.outdir}/{params.gname}.out.gff {output.gff}   2>/dev/null || touch {output.gff}
+        test -f {params.outdir}/{params.gname}.masked || \
+            {{ echo "ERROR: RepeatMasker did not produce .masked output — check repeat library and genome" >&2; exit 1; }}
+        mv {params.outdir}/{params.gname}.masked {output.masked}
+        test -s {output.masked} || {{ echo "ERROR: masked genome is empty" >&2; exit 1; }}
+        mv {params.outdir}/{params.gname}.out.gff {output.gff} 2>/dev/null || touch {output.gff}
         """
 
 # ── IsoSeq HiFi mapping → BRAKER3 RNA hints ──────────────────────────────────
@@ -410,6 +440,7 @@ if ISOSEQ_SAMPLES:
                 -T {output.bam}_tmp -o {output.bam}
             samtools index -@ 8 {output.bam}
             test -s {output.bam} || {{ echo "ERROR: {wildcards.sample} BAM empty" >&2; exit 1; }}
+            test -s {output.bai} || {{ echo "ERROR: {wildcards.sample} BAI missing" >&2; exit 1; }}
             """
 
     rule isoseq_merge:
@@ -431,6 +462,7 @@ if ISOSEQ_SAMPLES:
             samtools index -@ 16 {output.bam}
             samtools flagstat -@ 16 {output.bam}
             test -s {output.bam} || {{ echo "ERROR: merged_rna.bam empty" >&2; exit 1; }}
+            test -s {output.bai} || {{ echo "ERROR: merged_rna.bam.bai missing" >&2; exit 1; }}
             """
 
 # ── BRAKER3: gene prediction ──────────────────────────────────────────────────
@@ -440,9 +472,10 @@ if ISOSEQ_SAMPLES:
 # Output may be braker.aa OR augustus.hints.aa — both are handled below.
 rule braker4:
     input:
-        genome   = str(OUTDIR / "masked" / f"{SPECIES_NAME}.masked.fa"),
-        rnaseq   = [RNASEQ_BAM]  if RNASEQ_BAM  else [],
-        proteins = [PROTEIN_FA]  if PROTEIN_FA  else [],
+        genome      = str(OUTDIR / "masked" / f"{SPECIES_NAME}.masked.fa"),
+        rnaseq      = [RNASEQ_BAM]         if RNASEQ_BAM else [],
+        rnaseq_bai  = [RNASEQ_BAM + '.bai'] if RNASEQ_BAM else [],
+        proteins    = [PROTEIN_FA]          if PROTEIN_FA else [],
     output:
         gtf  = str(OUTDIR / "braker4" / "braker.gtf"),
         aa   = str(OUTDIR / "braker4" / "braker.aa"),
@@ -484,6 +517,9 @@ rule braker4:
                 {params.rna_flag} \
                 {params.prot_flag}
         # Fix root-owned files (busybox avoids sudo password requirement)
+        # || true: chown is best-effort; BRAKER3 container runs as root so outputs
+        # are root-owned. If busybox image is missing, Snakemake will PermissionError
+        # on touch — run `docker pull busybox` to fix. See PIPELINE_CHECKLIST BRAKER3 note.
         docker run --rm -v {params.outdir}:/workingdir busybox \
             sh -c "chown -R $(id -u):$(id -g) /workingdir" 2>/dev/null || true
         # BRAKER3 sometimes writes augustus.hints.aa instead of braker.aa
@@ -557,6 +593,7 @@ rule diamond_nr:
     conda: "envs/annotation.yaml"
     shell:
         """
+        set -euo pipefail
         diamond blastp \
             --db {input.db} \
             --query {input.prot} \
@@ -567,6 +604,7 @@ rule diamond_nr:
             --max-target-seqs 5 \
             --evalue 1e-5 \
             --sensitive
+        test -s {output} || {{ echo "ERROR: diamond_nr.tsv empty — no hits or DIAMOND crash" >&2; exit 1; }}
         """
 
 # ── InterProScan ──────────────────────────────────────────────────────────────
@@ -583,6 +621,7 @@ rule interproscan:
     conda: "envs/annotation.yaml"
     shell:
         """
+        set -euo pipefail
         {params.ipr}/interproscan.sh \
             -i {input.prot} \
             -o {output.tsv} \
@@ -591,4 +630,89 @@ rule interproscan:
             -goterms \
             -iprlookup \
             --disable-precalc
+        test -s {output.tsv} || {{ echo "ERROR: interproscan.tsv empty — check Java and InterProScan setup" >&2; exit 1; }}
         """
+
+
+# ── Synteny (hap1 vs hap2, optional) ─────────────────────────────────────────
+if RUN_SYNTENY:
+
+    rule minimap2_synteny:
+        """Whole-genome alignment of hap1 (query) vs hap2 (reference) for SyRI."""
+        input:
+            hap1 = GENOME_FA,
+            hap2 = HAP2_FA,
+        output:
+            bam = str(OUTDIR / "synteny" / "hap1_vs_hap2.bam"),
+            bai = str(OUTDIR / "synteny" / "hap1_vs_hap2.bam.csi"),
+        threads: SYNTENY_THREADS
+        resources: mem_mb = 32 * 1024
+        conda: "envs/syri.yaml"
+        shell:
+            """
+            set -euo pipefail
+            mkdir -p {OUTDIR}/synteny
+            minimap2 -a --cs -x asm5 -t {threads} \
+                {input.hap2} {input.hap1} \
+            | samtools sort -@ 4 -m 4G -o {output.bam}
+            samtools index --csi {output.bam}
+            test -s {output.bam} || {{ echo "ERROR: synteny BAM empty" >&2; exit 1; }}
+            test -s {output.bai} || {{ echo "ERROR: synteny BAI empty" >&2; exit 1; }}
+            """
+
+    rule syri:
+        """Detect synteny blocks and structural rearrangements between hap1 and hap2."""
+        input:
+            bam  = str(OUTDIR / "synteny" / "hap1_vs_hap2.bam"),
+            bai  = str(OUTDIR / "synteny" / "hap1_vs_hap2.bam.csi"),
+            hap1 = GENOME_FA,
+            hap2 = HAP2_FA,
+        output:
+            out     = str(OUTDIR / "synteny" / "syri.out"),
+            summary = str(OUTDIR / "synteny" / "syri.summary"),
+        params:
+            prefix = str(OUTDIR / "synteny") + "/",
+        resources: mem_mb = 32 * 1024
+        conda: "envs/syri.yaml"
+        shell:
+            """
+            set -euo pipefail
+            syri \
+                -c {input.bam} \
+                -f {input.hap1} \
+                -r {input.hap2} \
+                -k -F B \
+                --prefix {params.prefix}
+            test -s {output.out}     || {{ echo "ERROR: syri.out empty" >&2; exit 1; }}
+            test -s {output.summary} || {{ echo "ERROR: syri.summary empty" >&2; exit 1; }}
+            """
+
+    rule plotsr:
+        """Visualise hap1/hap2 synteny with plotsr."""
+        input:
+            syri_out = str(OUTDIR / "synteny" / "syri.out"),
+            hap1     = GENOME_FA,
+            hap2     = HAP2_FA,
+        output:
+            pdf = str(OUTDIR / "synteny" / "plotsr.pdf"),
+        params:
+            outdir    = str(OUTDIR / "synteny"),
+            hap1_name = Path(GENOME_FA).stem,
+            hap2_name = Path(HAP2_FA).stem if HAP2_FA else "hap2",
+        resources: mem_mb = 8 * 1024
+        conda: "envs/syri.yaml"
+        shell:
+            """
+            set -euo pipefail
+            # Build genomes.txt required by plotsr
+            GENOMES={params.outdir}/genomes.txt
+            printf '#file\tname\ttags\n'                            >  "$GENOMES"
+            printf '%s\t%s\tlw:1.5\n' '{input.hap1}' '{params.hap1_name}' >> "$GENOMES"
+            printf '%s\t%s\tlw:1.5\n' '{input.hap2}' '{params.hap2_name}' >> "$GENOMES"
+            plotsr \
+                --sr {input.syri_out} \
+                --genomes "$GENOMES" \
+                -o {output.pdf} \
+                -H 8 -W 5
+            test -s {output.pdf} || {{ echo "ERROR: plotsr PDF empty" >&2; exit 1; }}
+            """

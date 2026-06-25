@@ -5,3 +5,4 @@ channels:
 dependencies:
   - diamond=2.1.10
   - agat=1.4.0
+  - openjdk>=11
