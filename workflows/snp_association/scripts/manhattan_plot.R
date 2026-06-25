@@ -148,7 +148,9 @@ pca  <- fread(pca_file)
 setnames(pca, c("FID", "IID", paste0("PC", seq_len(ncol(pca) - 2))))
 
 pheno <- fread(pheno_file, header = TRUE)
-setnames(pheno, old = c("IID", "PHENOTYPE"), new = c("IID", "phenotype"), skip_absent = TRUE)
+# Normalise column names: sample_id (metadata.csv) or IID (plink pheno format)
+if ("sample_id" %in% names(pheno)) setnames(pheno, "sample_id", "IID")
+if ("PHENOTYPE" %in% names(pheno)) setnames(pheno, "PHENOTYPE", "phenotype")
 pca   <- merge(pca, pheno[, .(IID, phenotype)], by = "IID", all.x = TRUE)
 pca[, group := ifelse(phenotype == 1, "Salt-tolerant", "Salt-intolerant")]
 
@@ -156,7 +158,7 @@ p <- ggplot(pca, aes(PC1, PC2, colour = group, label = IID)) +
     geom_point(size = 3, alpha = 0.8) +
     scale_colour_manual(values = c("Salt-tolerant" = "#e41a1c", "Salt-intolerant" = "#377eb8")) +
     theme_bw(base_size = 13) +
-    labs(title = "PCA — population structure", colour = "Group",
+    labs(title = "PCA - population structure", colour = "Group",
          x = "PC1", y = "PC2")
 ggsave(pca_out, p, width = 7, height = 5)
 

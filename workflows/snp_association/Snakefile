@@ -367,6 +367,7 @@ rule plots:
         fst_top      = FST_TOP_PCT,
         has_cov      = HAS_COV,
         outdir       = str(OUTDIR / "plots"),
+    log:            str(OUTDIR / "plots" / "manhattan_plot.log"),
     conda: "envs/r_gwas.yaml"
     script: "scripts/manhattan_plot.R"
 
