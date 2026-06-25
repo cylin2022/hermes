@@ -2,6 +2,24 @@
 runs/
 logs/
 
+# BUSCO databases and run logs (large, machine-local)
+busco_downloads/
+busco_*.log
+**/busco_downloads/
+**/busco_*.log
+
+# samtools / tool temp files
+samtools.*.tmp.*.bam
+*.tmp.bam
+
+# Ad-hoc monitor scripts and logs
+monitor_*.sh
+monitor_*.log
+
+# Tool logs dropped in repo root or workflow dirs
+braker.agat.log
+**/braker.agat.log
+
 # Local config (may contain machine-specific paths)
 config/
 
