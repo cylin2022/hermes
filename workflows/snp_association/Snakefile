@@ -263,7 +263,7 @@ if HAS_COV:
             # prepare_inputs.py wrote pheno in raw VCF order; QC may have dropped samples.
             python3 - <<'PYEOF'
 import sys
-# Build {sample_id: pheno_value} from the raw pheno file (one value per line,
+# Build {{sample_id: pheno_value}} from the raw pheno file (one value per line,
 # written in VCF sample order — we need to map it back via the plink pheno file).
 # The plink phenotype.txt (FID IID PHENOTYPE) was also written by prepare_inputs.
 # For body size we use the z-scored value from bodysize_phenotype.txt, which has
