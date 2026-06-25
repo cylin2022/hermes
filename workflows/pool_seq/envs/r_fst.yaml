@@ -6,3 +6,4 @@ dependencies:
   - r-base=4.3
   - r-data.table=1.15
   - r-ggplot2=3.5
+  - r-utils
